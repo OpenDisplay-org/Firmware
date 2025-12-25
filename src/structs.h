@@ -39,7 +39,7 @@ struct ManufacturerData {
 struct PowerOption {
     uint8_t power_mode;         // Power source type enum
     uint8_t battery_capacity_mah[3]; // Battery capacity in mAh (3 bytes)
-    uint16_t sleep_timeout_ms;  // Nominal sleep time in milliseconds
+    uint16_t sleep_timeout_ms;  // Nominal awake time in milliseconds (advertising timeout)
     uint8_t tx_power;           // Transmit power setting
     uint8_t sleep_flags;        // Sleep-related flags (bitfield)
     uint8_t battery_sense_pin;  // Pin used to measure battery voltage (0xFF if none)
@@ -48,7 +48,8 @@ struct PowerOption {
     uint8_t capacity_estimator; // Battery chemistry estimator enum
     uint16_t voltage_scaling_factor; // Voltage scaling / divider factor
     uint32_t deep_sleep_current_ua; // Deep sleep current in microamperes
-    uint8_t reserved[12];       // Reserved bytes for future use
+    uint16_t deep_sleep_time_seconds; // Deep sleep duration in seconds (0 if not used)
+    uint8_t reserved[10];        // Reserved bytes for future use
 } __attribute__((packed));
 
 // 0x20: display (repeatable, max 4 instances)
@@ -60,7 +61,7 @@ struct DisplayConfig {
     uint16_t pixel_height;      // Pixel height of panel
     uint16_t active_width_mm;   // Active width of panel in millimeters
     uint16_t active_height_mm;  // Active height of panel in millimeters
-    uint16_t oepl_tagtype;      // Legacy OEPL tag type (optional)
+    uint16_t tag_type;          // Legacy tag type (optional)
     uint8_t rotation;           // Physical rotation in degrees (enum)
     uint8_t reset_pin;          // Pin number for panel reset (0xFF if none)
     uint8_t busy_pin;           // Pin number to read panel busy status (0xFF if none)

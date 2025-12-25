@@ -17,6 +17,22 @@ void setup() {
     } else {
         writeSerial("Git SHA: (not set)");
     }
+    #ifdef TARGET_ESP32
+    esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
+    bool is_deep_sleep_wake = (wakeup_reason != ESP_SLEEP_WAKEUP_UNDEFINED);
+    if (is_deep_sleep_wake) {
+        woke_from_deep_sleep = true;
+        deep_sleep_count++;
+        writeSerial("=== WOKE FROM DEEP SLEEP ===");
+        writeSerial("Wake-up reason: " + String(wakeup_reason));
+        writeSerial("Deep sleep count: " + String(deep_sleep_count));
+        minimalSetup();
+        return;
+    } else {
+        woke_from_deep_sleep = false;
+        writeSerial("=== NORMAL BOOT ===");
+    }
+    #endif
     writeSerial("Starting setup...");
     full_config_init();
     initio();
@@ -30,6 +46,28 @@ void setup() {
 
 void loop() {
     #ifdef TARGET_ESP32
+    if (woke_from_deep_sleep && advertising_timeout_active) {
+        if (pServer && pServer->getConnectedCount() > 0) {
+            writeSerial("BLE connection established - switching to full mode");
+            advertising_timeout_active = false;
+            fullSetupAfterConnection();
+            woke_from_deep_sleep = false;
+            return;
+        }
+        uint32_t advertising_duration = millis() - advertising_start_time;
+        uint32_t advertising_timeout_ms = globalConfig.power_option.sleep_timeout_ms;
+        if (advertising_timeout_ms == 0) {
+            advertising_timeout_ms = 10000;
+        }
+        if (advertising_duration >= advertising_timeout_ms) {
+            writeSerial("BLE advertising timeout (" + String(advertising_duration) + " ms) - no connection, returning to deep sleep");
+            advertising_timeout_active = false;
+            enterDeepSleep();
+            return;
+        }
+        delay(100);
+        return;
+    }
     if (commandQueueTail != commandQueueHead) {
         writeSerial("ESP32: Processing queued command (" + String(commandQueue[commandQueueTail].len) + " bytes)");
         imageDataWritten(NULL, NULL, commandQueue[commandQueueTail].data, commandQueue[commandQueueTail].len);
@@ -53,9 +91,21 @@ void loop() {
     if (bleActive) {
         delay(10);
     } else {
-        if(globalConfig.power_option.sleep_timeout_ms > 0){
-            delay(globalConfig.power_option.sleep_timeout_ms);
-            updatemsdata();
+        if (!woke_from_deep_sleep && deep_sleep_count == 0 && globalConfig.power_option.power_mode == 1) {
+            if (!firstBootDelayInitialized) {
+                firstBootDelayInitialized = true;
+                firstBootDelayStart = millis();
+                writeSerial("First boot: waiting 60s before entering deep sleep");
+            }
+            uint32_t elapsed = millis() - firstBootDelayStart;
+            if (elapsed < 60000) {
+                delay(500);
+                return;
+            }
+            writeSerial("First boot delay elapsed, deep sleep permitted");
+        }
+        if(globalConfig.power_option.deep_sleep_time_seconds > 0 && globalConfig.power_option.power_mode == 1){
+            enterDeepSleep();
         }
         else{
             delay(2000);
@@ -69,7 +119,6 @@ void loop() {
             uint32_t chunkDelay = (remainingDelay > CHECK_INTERVAL_MS) ? CHECK_INTERVAL_MS : remainingDelay;
             delay(chunkDelay);
             remainingDelay -= chunkDelay;
-            //sd_app_evt_wait();
         }
         updatemsdata();
     }
@@ -94,7 +143,6 @@ void initio(){
     digitalWrite(globalConfig.leds[0].led_2_g, HIGH);
     digitalWrite(globalConfig.leds[0].led_3_b, HIGH);
     }
-    
     if(globalConfig.system_config.pwr_pin != 0xFF){
     pinMode(globalConfig.system_config.pwr_pin, OUTPUT);
     digitalWrite(globalConfig.system_config.pwr_pin, LOW);
@@ -176,7 +224,7 @@ void initDataBuses(){
                 writeSerial("NOTE: nRF52840 using default I2C pins (config pins: SCL=" + String(bus->pin_1) + ", SDA=" + String(bus->pin_2) + ")");
                 #endif
                 writeSerial("I2C bus " + String(i) + " initialized: SCL=pin" + String(bus->pin_1) + ", SDA=pin" + String(bus->pin_2) + ", Speed=" + String(busSpeed) + "Hz");
-                scanI2CDevices();
+                //scanI2CDevices();
             } else {
                 writeSerial("WARNING: I2C bus " + String(i) + " configured but not initialized (only first bus supported)");
                 writeSerial("  SCL=pin" + String(bus->pin_1) + ", SDA=pin" + String(bus->pin_2) + ", Speed=" + String(busSpeed) + "Hz");
@@ -521,6 +569,61 @@ void readAXP2101Data(){
     writeSerial("=== AXP2101 Data Read Complete ===");
 }
 
+void powerDownAXP2101(){
+    writeSerial("=== Powering Down AXP2101 PMIC Rails ===");
+    Wire.beginTransmission(AXP2101_SLAVE_ADDRESS);
+    uint8_t error = Wire.endTransmission();
+    if(error != 0){
+        writeSerial("ERROR: AXP2101 not found at address 0x" + String(AXP2101_SLAVE_ADDRESS, HEX) + " (error: " + String(error) + ")");
+        return;
+    }
+    // Disable DCDC1 (clear bit 0 in DC_ONOFF_DVM_CTRL)
+    //that powers off the full board, so better not do it
+    //Wire.beginTransmission(AXP2101_SLAVE_ADDRESS);
+    //Wire.write(AXP2101_REG_DC_ONOFF_DVM_CTRL);
+    //error = Wire.endTransmission();
+    //uint8_t dcEnable = 0x00;
+    //if(error == 0){
+    //    Wire.requestFrom(AXP2101_SLAVE_ADDRESS, (uint8_t)1);
+    //    if(Wire.available()){
+    //        dcEnable = Wire.read();
+    //    }
+    //}
+    //dcEnable &= ~0x01; // Clear bit 0 to disable DCDC1
+    //Wire.beginTransmission(AXP2101_SLAVE_ADDRESS);
+    //Wire.write(AXP2101_REG_DC_ONOFF_DVM_CTRL);
+    //Wire.write(dcEnable);
+    //error = Wire.endTransmission();
+    //if(error == 0){
+    //    writeSerial("DCDC1 disabled");
+    //} else {
+    //    writeSerial("ERROR: Failed to disable DCDC1");
+    //}
+
+    // Disable ALDO4 (clear bit 3 in LDO_ONOFF_CTRL0)
+    Wire.beginTransmission(AXP2101_SLAVE_ADDRESS);
+    Wire.write(AXP2101_REG_LDO_ONOFF_CTRL0);
+    error = Wire.endTransmission();
+    uint8_t aldoEnable = 0x00;
+    if(error == 0){
+        Wire.requestFrom(AXP2101_SLAVE_ADDRESS, (uint8_t)1);
+        if(Wire.available()){
+            aldoEnable = Wire.read();
+        }
+    }
+    aldoEnable &= ~0x08; // Clear bit 3 to disable ALDO4
+    Wire.beginTransmission(AXP2101_SLAVE_ADDRESS);
+    Wire.write(AXP2101_REG_LDO_ONOFF_CTRL0);
+    Wire.write(aldoEnable);
+    error = Wire.endTransmission();
+    if(error == 0){
+        writeSerial("ALDO4 disabled");
+    } else {
+        writeSerial("ERROR: Failed to disable ALDO4");
+    }
+    writeSerial("=== AXP2101 PMIC Rails Powered Down ===");
+}
+
 void updatemsdata(){
     float batteryVoltage = readBatteryVoltage();
     float chipTemperature = readChipTemperature();
@@ -579,7 +682,7 @@ if (advertisementData != nullptr) {
             BLEAdvertisementData freshAdvertisementData;
             static String savedDeviceName = "";
             if (savedDeviceName.length() == 0) {
-                savedDeviceName = "OEPL" + getChipIdHex();
+                savedDeviceName = "OD" + getChipIdHex();
             }
             freshAdvertisementData.setName(savedDeviceName);
             freshAdvertisementData.setManufacturerData(manufacturerDataStr);
@@ -646,7 +749,7 @@ void ble_init(){
     Bluefruit.Periph.setConnectCallback(connect_callback);
     Bluefruit.Periph.setDisconnectCallback(disconnect_callback);
     writeSerial("BLE callbacks registered");
-    String deviceName = "OEPL" + getChipIdHex();
+    String deviceName = "OD" + getChipIdHex();
     Bluefruit.setName(deviceName.c_str());
     writeSerial("Device name set to: " + deviceName);
     writeSerial("Configuring power management...");
@@ -665,8 +768,14 @@ void ble_init(){
     Bluefruit.Advertising.start(0);
     #endif
     #ifdef TARGET_ESP32
+    ble_init_esp32(true); // Update manufacturer data for full setup
+    #endif
+}
+
+#ifdef TARGET_ESP32
+void ble_init_esp32(bool update_manufacturer_data) {
     writeSerial("=== Initializing ESP32 BLE ===");
-    String deviceName = "OEPL" + getChipIdHex();
+    String deviceName = "OD" + getChipIdHex();
     writeSerial("Device name will be: " + deviceName);
     BLEDevice::init(deviceName.c_str());
     writeSerial("Setting BLE MTU to 512...");
@@ -708,11 +817,11 @@ void ble_init(){
     }
     pAdvertising->addServiceUUID(serviceUUID);
     writeSerial("Service UUID added to advertising");
-    // Use global advertisementData object (not a local variable)
     advertisementData->setName(deviceName);
     writeSerial("Device name added to advertising");
-    // Add manufacturer data using updatemsdata function
-    updatemsdata();
+    if (update_manufacturer_data) {
+        updatemsdata();
+    }
     pAdvertising->setAdvertisementData(*advertisementData);
     pAdvertising->setScanResponse(false);
     pAdvertising->setMinPreferred(0x0006);
@@ -724,19 +833,92 @@ void ble_init(){
     writeSerial("=== BLE advertising started successfully ===");
     writeSerial("Device ready: " + deviceName);
     writeSerial("Waiting for BLE connections...");
-#endif
 }
+
+void minimalSetup() {
+    writeSerial("=== Minimal Setup (Deep Sleep Wake) ===");
+    full_config_init();
+    initio();
+    ble_init_esp32(true); // Update manufacturer data
+    writeSerial("=== BLE advertising started (minimal mode) ===");
+    writeSerial("Advertising for 10 seconds, waiting for connection...");
+    advertising_timeout_active = true;
+    advertising_start_time = millis();
+}
+
+void fullSetupAfterConnection() {
+    writeSerial("=== Full Setup After Connection ===");
+    memset(&bbep, 0, sizeof(BBEPDISP));
+    int panelType = mapEpd(globalConfig.displays[0].panel_ic_type);
+    writeSerial("Panel type: " + String(panelType));
+    bbepSetPanelType(&bbep, panelType);
+    writeSerial("=== Full setup completed ===");
+}
+
+void enterDeepSleep() {
+    // Only enter deep sleep if configured for battery power (power_mode == 1)
+    if (globalConfig.power_option.power_mode != 1) {
+        writeSerial("Skipping deep sleep - not battery powered (power_mode: " + String(globalConfig.power_option.power_mode) + ")");
+        delay(2000);
+        return;
+    }
+    
+    if (globalConfig.power_option.deep_sleep_time_seconds == 0) {
+        writeSerial("Skipping deep sleep - deep_sleep_time_seconds is 0");
+        delay(2000);
+        return;
+    }
+    
+    writeSerial("Entering deep sleep for " + String(globalConfig.power_option.deep_sleep_time_seconds) + " seconds");
+    //pwrmgm(false);
+    // Set flag for next wake-up
+    woke_from_deep_sleep = true; // Will be true on next boot
+    
+    // Stop BLE advertising
+    if (pServer != nullptr) {
+        BLEAdvertising *pAdvertising = pServer->getAdvertising();
+        if (pAdvertising != nullptr) {
+            pAdvertising->stop();
+            writeSerial("BLE advertising stopped");
+        }
+    }
+    
+    // Deinitialize BLE
+    BLEDevice::deinit(true);
+    writeSerial("BLE deinitialized");
+    
+    // Configure deep sleep
+    uint64_t sleep_timeout_us = (uint64_t)globalConfig.power_option.deep_sleep_time_seconds * 1000000ULL;
+    esp_sleep_enable_timer_wakeup(sleep_timeout_us);
+    
+    // Note: Power domain configuration is optional and varies by ESP32 variant
+    // Timer wake-up works without explicit power domain configuration
+    // For optimal power savings, power domains can be configured per variant if needed
+    
+    writeSerial("Entering deep sleep...");
+    delay(100); // Brief delay to ensure serial output is sent
+    
+    // Enter deep sleep
+    esp_deep_sleep_start();
+    // Code will not reach here - device will restart after wake-up
+}
+#endif
 
 void pwrmgm(bool onoff){
     if(globalConfig.display_count == 0){
         writeSerial("No display configured");
         return;
     }
+    uint8_t axp2101_bus_id = 0xFF;
+    bool axp2101_found = false;
+    for(uint8_t i = 0; i < globalConfig.sensor_count; i++){
+        if(globalConfig.sensors[i].sensor_type == 0x0003){
+            axp2101_bus_id = globalConfig.sensors[i].bus_id;
+            axp2101_found = true;
+            break;
+        }
+    }
     if(globalConfig.system_config.pwr_pin != 0xFF){
-    #ifdef TARGET_ESP32
-    digitalWrite(globalConfig.system_config.pwr_pin, HIGH);
-    #endif
-    #ifdef TARGET_NRF
     if(onoff){
         digitalWrite(globalConfig.system_config.pwr_pin, HIGH);
         pinMode(globalConfig.displays[0].reset_pin, OUTPUT);
@@ -756,11 +938,20 @@ void pwrmgm(bool onoff){
         pinMode(globalConfig.displays[0].data_pin, INPUT);
         digitalWrite(globalConfig.system_config.pwr_pin, LOW);
     }
-    #endif
     }
-   else{
-    writeSerial("Power pin not set");
-   }
+    else if(axp2101_found){
+        if(onoff){
+        writeSerial("Powering up AXP2101 PMIC...");
+            initAXP2101(axp2101_bus_id);
+        }
+        else{
+            writeSerial("Powering down AXP2101 PMIC...");
+            powerDownAXP2101();
+        }
+    }
+    else{
+        writeSerial("Power pin not set");
+       }
 }
 
 void writeSerial(String message, bool newLine){
@@ -768,7 +959,6 @@ void writeSerial(String message, bool newLine){
     if (newLine == true) Serial.println(message);
     else Serial.print(message);
     #endif
-    // When USB is disabled, writeSerial does nothing (no-op) to save power
 }
 
 void xiaoinit(){
@@ -786,18 +976,13 @@ void xiaoinit(){
 
 bool powerDownExternalFlash(uint8_t mosiPin, uint8_t misoPin, uint8_t sckPin, uint8_t csPin, uint8_t wpPin, uint8_t holdPin) {
     #ifdef TARGET_NRF
-    // Software SPI transfer function (bit-banging)
     auto spiTransfer = [&](uint8_t data) -> uint8_t {
         uint8_t result = 0;
         for (int i = 7; i >= 0; i--) {
-            // Set MOSI to current bit
             digitalWrite(mosiPin, (data >> i) & 1);
-            // Clock low
             digitalWrite(sckPin, LOW);
             delayMicroseconds(1);
-            // Read MISO
             result |= (digitalRead(misoPin) << i);
-            // Clock high
             digitalWrite(sckPin, HIGH);
             delayMicroseconds(1);
         }
@@ -825,7 +1010,6 @@ bool powerDownExternalFlash(uint8_t mosiPin, uint8_t misoPin, uint8_t sckPin, ui
     digitalWrite(csPin, HIGH);
     delay(10); // Wait for flash to wake up (typically 3-35us, using 10ms for safety)
     writeSerial("Wake-up command sent, waiting 10ms...");
-    // Read JEDEC ID before power-down (for verification)
     writeSerial("Reading JEDEC ID before power-down...");
     digitalWrite(csPin, LOW);
     spiTransfer(0x9F); // JEDEC ID command
@@ -978,7 +1162,7 @@ void initDisplay(){
     bbepWakeUp(&bbep);
     bbepSendCMDSequence(&bbep, bbep.pInitFull);
     String chipId = getChipIdHex();
-    String infoText = "openepaperlink.org\nName: OEPL" + chipId + "\nFW: " + String(getFirmwareMajor()) + "." + String(getFirmwareMinor()) + "\nEpaper driver by\nLarry Bank\ngithub.com/bitbank2";
+    String infoText = "opendisplay.org\nName: OD" + chipId + "\nFW: " + String(getFirmwareMajor()) + "." + String(getFirmwareMinor()) + "\nFirmware by\nJonas Niesner";
     if (globalConfig.displays[0].transmission_modes & TRANSMISSION_MODE_CLEAR_ON_BOOT) writeTextAndFill("");
     else writeTextAndFill(infoText.c_str());
     bbepRefresh(&bbep, REFRESH_FULL);
@@ -1631,7 +1815,8 @@ void printConfigSummary(){
     writeSerial("Battery Capacity: " + String(globalConfig.power_option.battery_capacity_mah[0]) + 
                " " + String(globalConfig.power_option.battery_capacity_mah[1]) + 
                " " + String(globalConfig.power_option.battery_capacity_mah[2]) + " mAh");
-    writeSerial("Sleep Timeout: " + String(globalConfig.power_option.sleep_timeout_ms) + " ms");
+    writeSerial("Awake Timeout: " + String(globalConfig.power_option.sleep_timeout_ms) + " ms");
+    writeSerial("Deep Sleep Time: " + String(globalConfig.power_option.deep_sleep_time_seconds) + " seconds");
     writeSerial("TX Power: " + String(globalConfig.power_option.tx_power));
     writeSerial("Sleep Flags: 0x" + String(globalConfig.power_option.sleep_flags, HEX));
     writeSerial("Battery Sense Pin: " + String(globalConfig.power_option.battery_sense_pin));
@@ -1650,7 +1835,7 @@ void printConfigSummary(){
         writeSerial("  Panel IC Type: 0x" + String(globalConfig.displays[i].panel_ic_type, HEX));
         writeSerial("  Resolution: " + String(globalConfig.displays[i].pixel_width) + "x" + String(globalConfig.displays[i].pixel_height));
         writeSerial("  Size: " + String(globalConfig.displays[i].active_width_mm) + "x" + String(globalConfig.displays[i].active_height_mm) + " mm");
-        writeSerial("  OEPL Tag Type: 0x" + String(globalConfig.displays[i].oepl_tagtype, HEX));
+        writeSerial("  Tag Type: 0x" + String(globalConfig.displays[i].tag_type, HEX));
         writeSerial("  Rotation: " + String(globalConfig.displays[i].rotation * 90) + " degrees");
         writeSerial("  Reset Pin: " + String(globalConfig.displays[i].reset_pin));
         writeSerial("  Busy Pin: " + String(globalConfig.displays[i].busy_pin));
@@ -1845,9 +2030,13 @@ void handleDirectWriteStart(uint8_t* data, uint16_t len) {
     writeSerial("Expected total bytes: " + String(directWriteTotalBytes) + (directWriteBitplanes ? " per plane" : ""));
     directWriteActive = true;
     directWriteBytesWritten = 0;
+    writeSerial("a");
     pwrmgm(true);
+    writeSerial("b");
     bbepInitIO(&bbep, globalConfig.displays[0].dc_pin, globalConfig.displays[0].reset_pin, globalConfig.displays[0].busy_pin, globalConfig.displays[0].cs_pin, globalConfig.displays[0].data_pin, globalConfig.displays[0].clk_pin, 8000000);
+    writeSerial("c");
     bbepWakeUp(&bbep);
+    writeSerial("d");
     bbepSendCMDSequence(&bbep, bbep.pInitFull);// important for some displays
     bbepSetAddrWindow(&bbep, 0, 0, globalConfig.displays[0].pixel_width, globalConfig.displays[0].pixel_height);
     bbepStartWrite(&bbep, directWriteBitplanes ? PLANE_0 : getplane());
@@ -2359,7 +2548,7 @@ void decompressDirectWriteData() {
     }
 }
 
-void handleDirectWriteEnd() {
+void handleDirectWriteEnd(uint8_t* data, uint16_t len) {
     if (!directWriteActive) {
         writeSerial("WARNING: Direct write end called but mode not active");
         return;
@@ -2377,7 +2566,24 @@ void handleDirectWriteEnd() {
     if (directWriteCompressed) {
         writeSerial("Compressed bytes received: " + String(directWriteCompressedReceived));
     }
-    bbepRefresh(&bbep, REFRESH_FULL);
+    int refreshMode = REFRESH_FULL;
+    if (data != nullptr && len >= 1) {
+        uint8_t refreshFlag = data[0];
+        if (refreshFlag == 1) {
+            refreshMode = REFRESH_FAST;
+            writeSerial("Using fast/partial refresh mode (requested)");
+        } else if (refreshFlag == 0) {
+            refreshMode = REFRESH_FULL;
+            writeSerial("Full refresh explicitly requested");
+        } else {
+            refreshMode = REFRESH_FULL;
+            writeSerial("Unknown refresh flag value (" + String(refreshFlag) + "), using full refresh");
+        }
+    } else {
+        writeSerial("No refresh mode specified, using full refresh (backward compatible)");
+    }
+    
+    bbepRefresh(&bbep, refreshMode);
     waitforrefresh(60);
     pwrmgm(false);
     directWriteActive = false;
@@ -2390,6 +2596,7 @@ void handleDirectWriteEnd() {
     directWriteWidth = 0;
     directWriteHeight = 0;
     directWriteTotalBytes = 0;
+    directWriteRefreshMode = 0;  // Reset refresh mode flag
     uint8_t ackResponse[] = {0x00, 0x72};
     sendResponse(ackResponse, sizeof(ackResponse));
     writeSerial("Direct write completed and display refreshed");
@@ -2435,7 +2642,7 @@ void imageDataWritten(BLEConnHandle conn_hdl, BLECharPtr chr, uint8_t* data, uin
             break;
         case 0x0072: // Direct Write End command
             writeSerial("=== DIRECT WRITE END COMMAND (0x0072) ===");
-            handleDirectWriteEnd();
+            handleDirectWriteEnd(data + 2, len - 2);  // Pass data after command bytes (2 bytes for command)
             break;
         default:
             writeSerial("ERROR: Unknown command: 0x" + String(command, HEX));

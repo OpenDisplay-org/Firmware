@@ -76,12 +76,17 @@ extern "C" {
 #include <BLEUtils.h>
 #include <BLEAdvertising.h>
 #include <esp_system.h>
+#include "esp_sleep.h"
 
 extern BLEServer* pServer;
 extern BLEService* pService;
 extern BLECharacteristic* pTxCharacteristic;
 extern BLECharacteristic* pRxCharacteristic;
 extern BLEAdvertisementData* advertisementData;  // Pointer to global advertisementData object
+
+// RTC memory variables for deep sleep state tracking (declared in main.cpp)
+extern bool advertising_timeout_active;
+extern uint32_t advertising_start_time;
 #endif
 
 BBEPDISP bbep;
@@ -125,6 +130,7 @@ uint32_t directWriteDecompressedTotal = 0;  // Expected decompressed size
 uint16_t directWriteWidth = 0;  // Display width in pixels
 uint16_t directWriteHeight = 0;  // Display height in pixels
 uint32_t directWriteTotalBytes = 0;  // Total bytes expected per plane (for bitplanes) or total (for others)
+uint8_t directWriteRefreshMode = 0;  // 0 = FULL (default), 1 = FAST/PARTIAL (if supported)
 
 // Direct write compressed mode: use same buffer as regular image upload
 uint32_t directWriteCompressedSize = 0;  // Total compressed size expected
@@ -139,6 +145,14 @@ void writeSerial(String message, bool newLine = true);
 void connect_callback(uint16_t conn_handle);
 void disconnect_callback(uint16_t conn_handle, uint8_t reason);
 void initDisplay();
+#ifdef TARGET_ESP32
+void minimalSetup();
+void fullSetupAfterConnection();
+void enterDeepSleep();
+void ble_init_esp32(bool update_manufacturer_data = true);
+extern bool advertising_timeout_active;
+extern uint32_t advertising_start_time;
+#endif
 String getChipIdHex();
 
 // Platform-specific type aliases for BLE callback
@@ -158,6 +172,7 @@ void scanI2CDevices();
 void initSensors();
 void initAXP2101(uint8_t busId);
 void readAXP2101Data();
+void powerDownAXP2101();
 void updatemsdata();
 void ble_init();
 void full_config_init();
@@ -172,7 +187,7 @@ void handleWriteConfigChunk(uint8_t* data, uint16_t len);
 void handleFirmwareVersion();
 void handleDirectWriteStart(uint8_t* data, uint16_t len);
 void handleDirectWriteData(uint8_t* data, uint16_t len);
-void handleDirectWriteEnd();
+void handleDirectWriteEnd(uint8_t* data = nullptr, uint16_t len = 0);
 void handleDirectWriteCompressedData(uint8_t* data, uint16_t len);
 void printConfigSummary();
 void reboot();
@@ -207,6 +222,20 @@ extern chunked_write_state_t chunkedWriteState;
 chunked_write_state_t chunkedWriteState = {false, 0, 0, {0}, 0, 0};
 struct GlobalConfig globalConfig = {0};
 uint8_t configReadResponseBuffer[128];
+
+#ifdef TARGET_ESP32
+// RTC memory variables for deep sleep state tracking
+RTC_DATA_ATTR bool woke_from_deep_sleep = false;
+RTC_DATA_ATTR uint32_t deep_sleep_count = 0;
+
+// Advertising timeout state variables
+bool advertising_timeout_active = false;
+uint32_t advertising_start_time = 0;
+
+// First-boot holdoff before allowing deep sleep
+static bool firstBootDelayInitialized = false;
+static uint32_t firstBootDelayStart = 0;
+#endif
 
 #define AXP2101_SLAVE_ADDRESS 0x34
 #define AXP2101_REG_POWER_STATUS 0x00
