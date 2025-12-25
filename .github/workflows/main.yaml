@@ -22,8 +22,8 @@ jobs:
 
       - name: Build NRF firmware
         run: |
-          platformio run --environment oeplnrf 
+          platformio run --environment nrf52840custom 
 
       - name: Build ESP32 firmware
         run: |
-          platformio run --environment oeplesp32-s3-N16R8
+          platformio run --environment esp32-s3-N16R8
