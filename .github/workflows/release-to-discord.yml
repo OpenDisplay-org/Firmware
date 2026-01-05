@@ -18,7 +18,7 @@ jobs:
           color: "5291001"  # #50BBF9
           username: "OpenDisplay Firmware"
           # avatar_url: "https://raw.githubusercontent.com/OpenDisplay-org/.github/main/profile/logo.png"
-          content: "||@everyone||"
+          # content: "||@everyone||"
           footer_title: "Firmware Release"
           footer_timestamp: true
           reduce_headings: true
