@@ -30,7 +30,7 @@ using namespace Adafruit_LittleFS_Namespace;
 #define DECOMP_CHUNK 512
 #define DECOMP_CHUNK_SIZE 4096
 #define MAX_DICT_SIZE 32768
-#define MAX_IMAGE_SIZE (50 * 1024)
+#define MAX_IMAGE_SIZE (54 * 1024)
 #define MAX_BLOCKS 64
 #define CONFIG_FILE_PATH "/config.bin"
 #define MAX_CONFIG_SIZE 4096
@@ -47,9 +47,21 @@ using namespace Adafruit_LittleFS_Namespace;
 // Response buffer constants
 #define MAX_RESPONSE_DATA_SIZE 100  // Maximum data size in response buffer
 
+// BLE response codes (second byte only, first byte is always 0x00 for success, 0xFF for error)
+#define RESP_DIRECT_WRITE_START_ACK  0x70  // Direct write start acknowledgment
+#define RESP_DIRECT_WRITE_DATA_ACK   0x71  // Direct write data acknowledgment
+#define RESP_DIRECT_WRITE_END_ACK    0x72  // Direct write end acknowledgment
+#define RESP_DIRECT_WRITE_REFRESH_SUCCESS 0x73  // Display refresh completed successfully
+#define RESP_DIRECT_WRITE_REFRESH_TIMEOUT 0x74  // Display refresh timed out
+#define RESP_DIRECT_WRITE_ERROR      0xFF  // Direct write error response
+#define RESP_CONFIG_READ             0x40  // Config read response
+#define RESP_CONFIG_WRITE             0x41  // Config write response
+#define RESP_CONFIG_CHUNK             0x42  // Config chunk response
+
 // Device flags bit definitions (for system_config.device_flags)
 #define DEVICE_FLAG_PWR_PIN      (1 << 0)  // Bit 0: Device has external power management pin
 #define DEVICE_FLAG_XIAOINIT     (1 << 1)  // Bit 1: Call xiaoinit() after config load (nRF52840 only)
+#define DEVICE_FLAG_WS_PP_INIT   (1 << 2)  // Bit 2: Call ws_pp_init() after config load (Waveshare Photo Printer)
 
 // Transmission mode bit definitions (for display.transmission_modes)
 #define TRANSMISSION_MODE_RAW          (1 << 0)  // Bit 0: Raw transfer
@@ -136,11 +148,14 @@ uint8_t directWriteRefreshMode = 0;  // 0 = FULL (default), 1 = FAST/PARTIAL (if
 uint32_t directWriteCompressedSize = 0;  // Total compressed size expected
 uint32_t directWriteCompressedReceived = 0;  // Total compressed bytes received
 uint8_t* directWriteCompressedBuffer = nullptr;  // Pointer to compressedDataBuffer (static allocation only)
+uint32_t directWriteStartTime = 0;  // Timestamp when direct write started (for timeout detection)
+bool displayPowerState = false;  // Track display power state (true = powered on, false = powered off)
 
 bool waitforrefresh(int timeout);
 void pwrmgm(bool onoff);
 bool powerDownExternalFlash(uint8_t mosiPin, uint8_t misoPin, uint8_t sckPin, uint8_t csPin, uint8_t wpPin, uint8_t holdPin);
 void xiaoinit();
+void ws_pp_init();
 void writeSerial(String message, bool newLine = true);
 void connect_callback(uint16_t conn_handle);
 void disconnect_callback(uint16_t conn_handle, uint8_t reason);
@@ -185,6 +200,7 @@ void handleReadConfig();
 void handleWriteConfig(uint8_t* data, uint16_t len);
 void handleWriteConfigChunk(uint8_t* data, uint16_t len);
 void handleFirmwareVersion();
+void cleanupDirectWriteState(bool refreshDisplay);
 void handleDirectWriteStart(uint8_t* data, uint16_t len);
 void handleDirectWriteData(uint8_t* data, uint16_t len);
 void handleDirectWriteEnd(uint8_t* data = nullptr, uint16_t len = 0);
@@ -256,6 +272,16 @@ static uint32_t firstBootDelayStart = 0;
 #define AXP2101_REG_ADC_DATA_SYS_VOL_L 0x39
 #define AXP2101_REG_BAT_PERCENT_DATA 0xA4
 #define AXP2101_REG_PWRON_STATUS 0x20
+#define AXP2101_REG_BAT_DETECTION_CTRL 0x68  // Battery detection control
+#define AXP2101_REG_IRQ_ENABLE1 0x40  // IRQ enable register 1
+#define AXP2101_REG_IRQ_ENABLE2 0x41  // IRQ enable register 2
+#define AXP2101_REG_IRQ_ENABLE3 0x42  // IRQ enable register 3
+#define AXP2101_REG_IRQ_ENABLE4 0x43  // IRQ enable register 4
+#define AXP2101_REG_IRQ_STATUS1 0x44  // IRQ status register 1
+#define AXP2101_REG_IRQ_STATUS2 0x45  // IRQ status register 2
+#define AXP2101_REG_IRQ_STATUS3 0x46  // IRQ status register 3
+#define AXP2101_REG_IRQ_STATUS4 0x47  // IRQ status register 4
+#define AXP2101_REG_LDO_ONOFF_CTRL1 0x91  // LDO control register 1 (BLDO1-2, CPUSLDO, DLDO1-2)
 
 #ifdef TARGET_NRF
 BLEDfu bledfu;
@@ -293,21 +319,17 @@ uint8_t commandQueueTail = 0;
 class MyBLEServerCallbacks : public BLEServerCallbacks {
     void onConnect(BLEServer* pServer) {
         writeSerial("=== BLE CLIENT CONNECTED (ESP32) ===");
-        writeSerial("Client connected to ESP32 BLE server");
-        delay(100);  // Give connection time to fully establish
-        writeSerial("Number of connected clients: " + String(pServer->getConnectedCount()));
     }
     void onDisconnect(BLEServer* pServer) {
         writeSerial("=== BLE CLIENT DISCONNECTED (ESP32) ===");
-        writeSerial("Client disconnected from ESP32 BLE server");
-        writeSerial("Number of remaining clients: " + String(pServer->getConnectedCount()));
+        cleanupDirectWriteState(true);
         writeSerial("Waiting before restarting advertising...");
         delay(500);
         if (pServer->getConnectedCount() == 0) {
             BLEDevice::startAdvertising();
             writeSerial("Advertising restarted");
         } else {
-            writeSerial("Other clients still connected, not restarting advertising");
+            writeSerial("not restarting advertising");
         }
     }
 };

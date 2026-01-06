@@ -65,7 +65,6 @@ void loop() {
             enterDeepSleep();
             return;
         }
-        delay(100);
         return;
     }
     if (commandQueueTail != commandQueueHead) {
@@ -82,14 +81,21 @@ void loop() {
         responseQueue[responseQueueTail].pending = false;
         responseQueueTail = (responseQueueTail + 1) % RESPONSE_QUEUE_SIZE;
         writeSerial("Response sent successfully");
-        delay(20); // Brief delay to let BLE stack process
+        //delay(20); // Brief delay to let BLE stack process
+    }
+    if (directWriteActive && directWriteStartTime > 0) {
+        uint32_t directWriteDuration = millis() - directWriteStartTime;
+        if (directWriteDuration > 120000) {  // 120 second timeout
+            writeSerial("ERROR: Direct write timeout (" + String(directWriteDuration) + " ms) - cleaning up stuck state");
+            cleanupDirectWriteState(true);
+        }
     }
     bool bleActive = (commandQueueTail != commandQueueHead) || 
                      (responseQueueTail != responseQueueHead) ||
                      (pServer && pServer->getConnectedCount() > 0);
     
     if (bleActive) {
-        delay(10);
+        delay(1);
     } else {
         if (!woke_from_deep_sleep && deep_sleep_count == 0 && globalConfig.power_option.power_mode == 1) {
             if (!firstBootDelayInitialized) {
@@ -99,7 +105,7 @@ void loop() {
             }
             uint32_t elapsed = millis() - firstBootDelayStart;
             if (elapsed < 60000) {
-                delay(500);
+                delay(5);
                 return;
             }
             writeSerial("First boot delay elapsed, deep sleep permitted");
@@ -110,6 +116,7 @@ void loop() {
         else{
             delay(2000);
         }
+        if(!bleActive)writeSerial("Loop end: " + String(millis() / 100));
     }
     #else
     if(globalConfig.power_option.sleep_timeout_ms > 0){
@@ -125,8 +132,8 @@ void loop() {
     else{
         delay(500);
     }
-    #endif
     writeSerial("Loop end: " + String(millis() / 100));
+    #endif
 }
 
 void initio(){
@@ -285,9 +292,9 @@ void initSensors(){
         writeSerial("  Bus ID: " + String(sensor->bus_id));
         if(sensor->sensor_type == 0x0003){ // AXP2101 PMIC
             writeSerial("  Detected AXP2101 PMIC sensor");
-            initAXP2101(sensor->bus_id);
-            delay(100);
-            readAXP2101Data();
+            //initAXP2101(sensor->bus_id);
+            //delay(100);
+            //readAXP2101Data();
         }
         else if(sensor->sensor_type == 0x0001){ // Temperature sensor
             writeSerial("  Temperature sensor (initialization not implemented)");
@@ -303,6 +310,10 @@ void initSensors(){
 }
 
 void initAXP2101(uint8_t busId){
+    pinMode(21, OUTPUT);
+    digitalWrite(21, LOW);
+    delay(100);
+    digitalWrite(21, HIGH);
     writeSerial("=== Initializing AXP2101 PMIC ===");
     if(busId >= globalConfig.data_bus_count){
         writeSerial("ERROR: Invalid bus ID " + String(busId) + " (only " + String(globalConfig.data_bus_count) + " buses configured)");
@@ -577,30 +588,84 @@ void powerDownAXP2101(){
         writeSerial("ERROR: AXP2101 not found at address 0x" + String(AXP2101_SLAVE_ADDRESS, HEX) + " (error: " + String(error) + ")");
         return;
     }
-    // Disable DCDC1 (clear bit 0 in DC_ONOFF_DVM_CTRL)
-    //that powers off the full board, so better not do it
-    //Wire.beginTransmission(AXP2101_SLAVE_ADDRESS);
-    //Wire.write(AXP2101_REG_DC_ONOFF_DVM_CTRL);
-    //error = Wire.endTransmission();
-    //uint8_t dcEnable = 0x00;
-    //if(error == 0){
-    //    Wire.requestFrom(AXP2101_SLAVE_ADDRESS, (uint8_t)1);
-    //    if(Wire.available()){
-    //        dcEnable = Wire.read();
-    //    }
-    //}
-    //dcEnable &= ~0x01; // Clear bit 0 to disable DCDC1
-    //Wire.beginTransmission(AXP2101_SLAVE_ADDRESS);
-    //Wire.write(AXP2101_REG_DC_ONOFF_DVM_CTRL);
-    //Wire.write(dcEnable);
-    //error = Wire.endTransmission();
-    //if(error == 0){
-    //    writeSerial("DCDC1 disabled");
-    //} else {
-    //    writeSerial("ERROR: Failed to disable DCDC1");
-    //}
-
-    // Disable ALDO4 (clear bit 3 in LDO_ONOFF_CTRL0)
+    Wire.beginTransmission(AXP2101_SLAVE_ADDRESS);
+    Wire.write(AXP2101_REG_IRQ_ENABLE1);
+    Wire.write(0x00); // Disable all IRQs in register 1
+    error = Wire.endTransmission();
+    if(error == 0){
+        Wire.beginTransmission(AXP2101_SLAVE_ADDRESS);
+        Wire.write(AXP2101_REG_IRQ_ENABLE2);
+        Wire.write(0x00); // Disable all IRQs in register 2
+        error = Wire.endTransmission();
+    }
+    if(error == 0){
+        Wire.beginTransmission(AXP2101_SLAVE_ADDRESS);
+        Wire.write(AXP2101_REG_IRQ_ENABLE3);
+        Wire.write(0x00); // Disable all IRQs in register 3
+        error = Wire.endTransmission();
+    }
+    if(error == 0){
+        Wire.beginTransmission(AXP2101_SLAVE_ADDRESS);
+        Wire.write(AXP2101_REG_IRQ_ENABLE4);
+        Wire.write(0x00); // Disable all IRQs in register 4
+        error = Wire.endTransmission();
+    }
+    if(error == 0){
+        Wire.beginTransmission(AXP2101_SLAVE_ADDRESS);
+        Wire.write(AXP2101_REG_IRQ_STATUS1);
+        Wire.write(0xFF); // Clear all IRQ status bits
+        error = Wire.endTransmission();
+    }
+    if(error == 0){
+        Wire.beginTransmission(AXP2101_SLAVE_ADDRESS);
+        Wire.write(AXP2101_REG_IRQ_STATUS2);
+        Wire.write(0xFF);
+        error = Wire.endTransmission();
+    }
+    if(error == 0){
+        Wire.beginTransmission(AXP2101_SLAVE_ADDRESS);
+        Wire.write(AXP2101_REG_IRQ_STATUS3);
+        Wire.write(0xFF);
+        error = Wire.endTransmission();
+    }
+    if(error == 0){
+        Wire.beginTransmission(AXP2101_SLAVE_ADDRESS);
+        Wire.write(AXP2101_REG_IRQ_STATUS4);
+        Wire.write(0xFF);
+        error = Wire.endTransmission();
+        if(error == 0){
+            writeSerial("All IRQs disabled and status cleared");
+        }
+    }
+    Wire.beginTransmission(AXP2101_SLAVE_ADDRESS);
+    Wire.write(AXP2101_REG_DC_ONOFF_DVM_CTRL);
+    error = Wire.endTransmission();
+    uint8_t dcEnable = 0x00;
+    if(error == 0){
+        Wire.requestFrom(AXP2101_SLAVE_ADDRESS, (uint8_t)1);
+        if(Wire.available()){
+            dcEnable = Wire.read();
+        }
+    }
+    dcEnable &= 0x01; // Keep only DC1 (bit 0), clear bits 1-4 for DC2-5
+    Wire.beginTransmission(AXP2101_SLAVE_ADDRESS);
+    Wire.write(AXP2101_REG_DC_ONOFF_DVM_CTRL);
+    Wire.write(dcEnable);
+    error = Wire.endTransmission();
+    if(error == 0){
+        writeSerial("DC2-5 disabled (DC1 kept enabled)");
+    } else {
+        writeSerial("ERROR: Failed to disable DC2-5");
+    }
+    Wire.beginTransmission(AXP2101_SLAVE_ADDRESS);
+    Wire.write(AXP2101_REG_LDO_ONOFF_CTRL1);
+    Wire.write(0x00); // Disable all LDOs in register 1
+    error = Wire.endTransmission();
+    if(error == 0){
+        writeSerial("BLDO1-2, CPUSLDO, DLDO1-2 disabled");
+    } else {
+        writeSerial("ERROR: Failed to disable BLDO/CPUSLDO/DLDO rails");
+    }
     Wire.beginTransmission(AXP2101_SLAVE_ADDRESS);
     Wire.write(AXP2101_REG_LDO_ONOFF_CTRL0);
     error = Wire.endTransmission();
@@ -611,16 +676,54 @@ void powerDownAXP2101(){
             aldoEnable = Wire.read();
         }
     }
-    aldoEnable &= ~0x08; // Clear bit 3 to disable ALDO4
+    aldoEnable &= ~0x0F; // Clear bits 0-3 to disable ALDO1, ALDO2, ALDO3, and ALDO4
     Wire.beginTransmission(AXP2101_SLAVE_ADDRESS);
     Wire.write(AXP2101_REG_LDO_ONOFF_CTRL0);
     Wire.write(aldoEnable);
     error = Wire.endTransmission();
     if(error == 0){
-        writeSerial("ALDO4 disabled");
+        writeSerial("ALDO1-4 disabled");
     } else {
-        writeSerial("ERROR: Failed to disable ALDO4");
+        writeSerial("ERROR: Failed to disable ALDO rails");
     }
+    Wire.beginTransmission(AXP2101_SLAVE_ADDRESS);
+    Wire.write(AXP2101_REG_POWER_WAKEUP_CTL);
+    error = Wire.endTransmission();
+    uint8_t wakeupCtrl = 0x00;
+    if(error == 0){
+        Wire.requestFrom(AXP2101_SLAVE_ADDRESS, (uint8_t)1);
+        if(Wire.available()){
+            wakeupCtrl = Wire.read();
+        }
+    }
+    if(!(wakeupCtrl & 0x04)) {
+        wakeupCtrl |= 0x04; // Set bit 2: Wake-up power setting same as before sleep
+    }
+    if(wakeupCtrl & 0x08) {
+        wakeupCtrl &= ~0x08; // Clear bit 3: PWROK doesn't need to be pulled low on wake-up
+    }
+    if(!(wakeupCtrl & 0x10)) {
+        wakeupCtrl |= 0x10; // Set bit 4: IRQ pin can wake up
+    }
+    wakeupCtrl |= 0x80; // Set bit 7 to enable sleep mode
+    Wire.beginTransmission(AXP2101_SLAVE_ADDRESS);
+    Wire.write(AXP2101_REG_POWER_WAKEUP_CTL);
+    Wire.write(wakeupCtrl);
+    error = Wire.endTransmission();
+    if(error == 0){
+        writeSerial("AXP2101 wake-up configured and sleep mode enabled");
+    } else {
+        writeSerial("ERROR: Failed to configure AXP2101 sleep mode");
+    }
+        Wire.beginTransmission(AXP2101_SLAVE_ADDRESS);
+        Wire.write(AXP2101_REG_ADC_CHANNEL_CTRL);
+        Wire.write(0x00); // Disable all ADC channels
+        error = Wire.endTransmission();
+        if(error == 0){
+            writeSerial("All ADC channels disabled");
+        } else {
+            writeSerial("ERROR: Failed to disable ADC channels");
+        }
     writeSerial("=== AXP2101 PMIC Rails Powered Down ===");
 }
 
@@ -724,6 +827,11 @@ void full_config_init(){
             writeSerial("xiaoinit() completed");
         }
         #endif
+        if (globalConfig.loaded && (globalConfig.system_config.device_flags & DEVICE_FLAG_WS_PP_INIT)) {
+            writeSerial("Device flag DEVICE_FLAG_WS_PP_INIT is set, calling ws_pp_init()...");
+            ws_pp_init();
+            writeSerial("ws_pp_init() completed");
+        }
     } else {
        writeSerial("Global configuration load failed or no config found");
     }
@@ -856,25 +964,18 @@ void fullSetupAfterConnection() {
 }
 
 void enterDeepSleep() {
-    // Only enter deep sleep if configured for battery power (power_mode == 1)
     if (globalConfig.power_option.power_mode != 1) {
         writeSerial("Skipping deep sleep - not battery powered (power_mode: " + String(globalConfig.power_option.power_mode) + ")");
         delay(2000);
         return;
     }
-    
     if (globalConfig.power_option.deep_sleep_time_seconds == 0) {
         writeSerial("Skipping deep sleep - deep_sleep_time_seconds is 0");
         delay(2000);
         return;
     }
-    
     writeSerial("Entering deep sleep for " + String(globalConfig.power_option.deep_sleep_time_seconds) + " seconds");
-    //pwrmgm(false);
-    // Set flag for next wake-up
     woke_from_deep_sleep = true; // Will be true on next boot
-    
-    // Stop BLE advertising
     if (pServer != nullptr) {
         BLEAdvertising *pAdvertising = pServer->getAdvertising();
         if (pAdvertising != nullptr) {
@@ -882,25 +983,13 @@ void enterDeepSleep() {
             writeSerial("BLE advertising stopped");
         }
     }
-    
-    // Deinitialize BLE
     BLEDevice::deinit(true);
     writeSerial("BLE deinitialized");
-    
-    // Configure deep sleep
     uint64_t sleep_timeout_us = (uint64_t)globalConfig.power_option.deep_sleep_time_seconds * 1000000ULL;
     esp_sleep_enable_timer_wakeup(sleep_timeout_us);
-    
-    // Note: Power domain configuration is optional and varies by ESP32 variant
-    // Timer wake-up works without explicit power domain configuration
-    // For optimal power savings, power domains can be configured per variant if needed
-    
     writeSerial("Entering deep sleep...");
     delay(100); // Brief delay to ensure serial output is sent
-    
-    // Enter deep sleep
     esp_deep_sleep_start();
-    // Code will not reach here - device will restart after wake-up
 }
 #endif
 
@@ -909,6 +998,7 @@ void pwrmgm(bool onoff){
         writeSerial("No display configured");
         return;
     }
+    displayPowerState = onoff;
     uint8_t axp2101_bus_id = 0xFF;
     bool axp2101_found = false;
     for(uint8_t i = 0; i < globalConfig.sensor_count; i++){
@@ -918,9 +1008,22 @@ void pwrmgm(bool onoff){
             break;
         }
     }
-    if(globalConfig.system_config.pwr_pin != 0xFF){
+    if(axp2101_found){
+        if(onoff){
+        writeSerial("Powering up AXP2101 PMIC...");
+            initAXP2101(axp2101_bus_id);
+        }
+        else{
+            writeSerial("Powering down AXP2101 PMIC...");
+            powerDownAXP2101();
+            Wire.end();
+            pinMode(47, OUTPUT);
+            digitalWrite(47, HIGH);
+            pinMode(48, OUTPUT);
+            digitalWrite(48, HIGH);
+        }
+    }
     if(onoff){
-        digitalWrite(globalConfig.system_config.pwr_pin, HIGH);
         pinMode(globalConfig.displays[0].reset_pin, OUTPUT);
         pinMode(globalConfig.displays[0].cs_pin, OUTPUT);
         pinMode(globalConfig.displays[0].dc_pin, OUTPUT);
@@ -936,18 +1039,15 @@ void pwrmgm(bool onoff){
         pinMode(globalConfig.displays[0].dc_pin, INPUT);
         pinMode(globalConfig.displays[0].clk_pin, INPUT);
         pinMode(globalConfig.displays[0].data_pin, INPUT);
+    }
+    if(globalConfig.system_config.pwr_pin != 0xFF){
+    if(onoff){
+        digitalWrite(globalConfig.system_config.pwr_pin, HIGH);
+        delay(200);
+    }
+    else{
         digitalWrite(globalConfig.system_config.pwr_pin, LOW);
     }
-    }
-    else if(axp2101_found){
-        if(onoff){
-        writeSerial("Powering up AXP2101 PMIC...");
-            initAXP2101(axp2101_bus_id);
-        }
-        else{
-            writeSerial("Powering down AXP2101 PMIC...");
-            powerDownAXP2101();
-        }
     }
     else{
         writeSerial("Power pin not set");
@@ -972,6 +1072,39 @@ void xiaoinit(){
     pinMode(15, INPUT);
     pinMode(3, INPUT);
     pinMode(28, INPUT);
+}
+
+void ws_pp_init(){
+    writeSerial("===  Photo Printer Initialization ===");
+    pinMode(21, OUTPUT);
+    digitalWrite(21, HIGH);
+    pinMode(1, INPUT);
+    pinMode(2, INPUT);
+    pinMode(3, INPUT);
+    pinMode(4, INPUT);
+    pinMode(5, OUTPUT);
+    digitalWrite(5, HIGH);
+    pinMode(6, INPUT);
+    pinMode(7, LOW);
+    digitalWrite(7, LOW);
+    pinMode(14, INPUT);
+    pinMode(15, INPUT);
+    pinMode(16, INPUT);
+    pinMode(17, INPUT);
+    pinMode(18, INPUT);
+    pinMode(38, OUTPUT);
+    digitalWrite(38, HIGH);
+    pinMode(39, OUTPUT);
+    digitalWrite(39, HIGH);
+    pinMode(40, OUTPUT);
+    digitalWrite(40, HIGH);
+    pinMode(41, OUTPUT);
+    digitalWrite(41, HIGH);
+    pinMode(42, OUTPUT);
+    digitalWrite(42, HIGH);
+    pinMode(45, OUTPUT);
+    digitalWrite(45, HIGH);
+    writeSerial("Photo Printer initialized");
 }
 
 bool powerDownExternalFlash(uint8_t mosiPin, uint8_t misoPin, uint8_t sckPin, uint8_t csPin, uint8_t wpPin, uint8_t holdPin) {
@@ -1179,12 +1312,16 @@ bool waitforrefresh(int timeout){
         delay(100);
         if(i % 5 == 0)writeSerial(".",false);
         if(!bbepIsBusy(&bbep)){ 
-        writeSerial(".");
-        writeSerial("Refresh took ",false);
-        writeSerial((String)((float)i / 10),false);
-        writeSerial(" seconds");
-        delay(200);
-        return true;
+            if(i == 0){
+                writeSerial("ERROR: Epaper not busy after refresh command - refresh may not have started");
+                return false;
+            }
+            writeSerial(".");
+            writeSerial("Refresh took ",false);
+            writeSerial((String)((float)i / 10),false);
+            writeSerial(" seconds");
+            delay(200);
+            return true;
         }
     }
     writeSerial("Refresh timed out");
@@ -1200,6 +1337,7 @@ void disconnect_callback(uint16_t conn_handle, uint8_t reason) {
     (void)reason;
     writeSerial("=== BLE CLIENT DISCONNECTED ===");
     writeSerial("Disconnect reason: " + String(reason));
+    cleanupDirectWriteState(true);
 }
 
 String getChipIdHex() {
@@ -1464,7 +1602,7 @@ void handleReadConfig(){
         }
         writeSerial("Config read response sent (" + String(configLen) + " bytes) in " + String(chunkNumber) + " chunks");
     } else {
-        uint8_t errorResponse[] = {0xFF, 0x40, 0x00, 0x00}; // Error, command, no data
+        uint8_t errorResponse[] = {0xFF, RESP_CONFIG_READ, 0x00, 0x00}; // Error, command, no data
         sendResponse(errorResponse, sizeof(errorResponse));
         writeSerial("Config read failed - sent error response");
     }
@@ -1528,16 +1666,16 @@ void handleWriteConfig(uint8_t* data, uint16_t len){
             chunkedWriteState.receivedChunks = 1;
             writeSerial("Large single transmission: " + String(chunkSize) + " bytes");
         }
-        uint8_t ackResponse[] = {0x00, 0x41, 0x00, 0x00}; // Success, command, chunk received
+        uint8_t ackResponse[] = {0x00, RESP_CONFIG_WRITE, 0x00, 0x00}; // Success, command, chunk received
         sendResponse(ackResponse, sizeof(ackResponse));
         return;
     }
     if (saveConfig(data, len)) {
-        uint8_t successResponse[] = {0x00, 0x41, 0x00, 0x00}; // Success, command, no data
+        uint8_t successResponse[] = {0x00, RESP_CONFIG_WRITE, 0x00, 0x00}; // Success, command, no data
         sendResponse(successResponse, sizeof(successResponse));
         writeSerial("Config write successful");
     } else {
-        uint8_t errorResponse[] = {0xFF, 0x41, 0x00, 0x00}; // Error, command, no data
+        uint8_t errorResponse[] = {0xFF, RESP_CONFIG_WRITE, 0x00, 0x00}; // Error, command, no data
         sendResponse(errorResponse, sizeof(errorResponse));
         writeSerial("Config write failed");
     }
@@ -1546,7 +1684,7 @@ void handleWriteConfig(uint8_t* data, uint16_t len){
 void handleWriteConfigChunk(uint8_t* data, uint16_t len){
     if (!chunkedWriteState.active) {
         writeSerial("ERROR: No chunked write in progress");
-        uint8_t errorResponse[] = {0xFF, 0x42, 0x00, 0x00};
+        uint8_t errorResponse[] = {0xFF, RESP_CONFIG_CHUNK, 0x00, 0x00};
         sendResponse(errorResponse, sizeof(errorResponse));
         return;
     }
@@ -1557,21 +1695,21 @@ void handleWriteConfigChunk(uint8_t* data, uint16_t len){
     if (len > CONFIG_CHUNK_SIZE) {
         writeSerial("ERROR: Chunk too large (" + String(len) + " bytes)");
         chunkedWriteState.active = false;
-        uint8_t errorResponse[] = {0xFF, 0x42, 0x00, 0x00};
+        uint8_t errorResponse[] = {0xFF, RESP_CONFIG_CHUNK, 0x00, 0x00};
         sendResponse(errorResponse, sizeof(errorResponse));
         return;
     }
     if (chunkedWriteState.receivedSize + len > MAX_CONFIG_SIZE) {
         writeSerial("ERROR: Chunk would exceed max config size");
         chunkedWriteState.active = false;
-        uint8_t errorResponse[] = {0xFF, 0x42, 0x00, 0x00}; // Error, command, no data
+        uint8_t errorResponse[] = {0xFF, RESP_CONFIG_CHUNK, 0x00, 0x00}; // Error, command, no data
         sendResponse(errorResponse, sizeof(errorResponse));
         return;
     }
     if (chunkedWriteState.receivedChunks >= MAX_CONFIG_CHUNKS) {
         writeSerial("ERROR: Too many chunks received");
         chunkedWriteState.active = false;
-        uint8_t errorResponse[] = {0xFF, 0x42, 0x00, 0x00};
+        uint8_t errorResponse[] = {0xFF, RESP_CONFIG_CHUNK, 0x00, 0x00};
         sendResponse(errorResponse, sizeof(errorResponse));
         return;
     }
@@ -1582,11 +1720,11 @@ void handleWriteConfigChunk(uint8_t* data, uint16_t len){
     if (chunkedWriteState.receivedChunks >= chunkedWriteState.expectedChunks) {
         writeSerial("All chunks received, saving config (" + String(chunkedWriteState.receivedSize) + " bytes)");
         if (saveConfig(chunkedWriteState.buffer, chunkedWriteState.receivedSize)) {
-            uint8_t successResponse[] = {0x00, 0x42, 0x00, 0x00}; // Success, command, no data
+            uint8_t successResponse[] = {0x00, RESP_CONFIG_CHUNK, 0x00, 0x00}; // Success, command, no data
             sendResponse(successResponse, sizeof(successResponse));
             writeSerial("Chunked config write successful");
     } else {
-            uint8_t errorResponse[] = {0xFF, 0x42, 0x00, 0x00}; // Error, command, no data
+            uint8_t errorResponse[] = {0xFF, RESP_CONFIG_CHUNK, 0x00, 0x00}; // Error, command, no data
             sendResponse(errorResponse, sizeof(errorResponse));
             writeSerial("Chunked config write failed");
         }
@@ -1594,7 +1732,7 @@ void handleWriteConfigChunk(uint8_t* data, uint16_t len){
         chunkedWriteState.receivedSize = 0;
         chunkedWriteState.receivedChunks = 0;
     } else {
-        uint8_t ackResponse[] = {0x00, 0x42, 0x00, 0x00}; // Success, command, chunk received
+        uint8_t ackResponse[] = {0x00, RESP_CONFIG_CHUNK, 0x00, 0x00}; // Success, command, chunk received
         sendResponse(ackResponse, sizeof(ackResponse));
     }
 }
@@ -1801,6 +1939,7 @@ void printConfigSummary(){
     #ifdef TARGET_NRF
     writeSerial("  XIAOINIT flag: " + String((globalConfig.system_config.device_flags & DEVICE_FLAG_XIAOINIT) ? "enabled" : "disabled"));
     #endif
+    writeSerial("  WS_PP_INIT flag: " + String((globalConfig.system_config.device_flags & DEVICE_FLAG_WS_PP_INIT) ? "enabled" : "disabled"));
     writeSerial("Power Pin: " + String(globalConfig.system_config.pwr_pin));
     writeSerial("");
     // Manufacturer Data
@@ -1966,6 +2105,10 @@ float readChipTemperature() {
 
 void handleDirectWriteStart(uint8_t* data, uint16_t len) {
     writeSerial("=== DIRECT WRITE START ===");
+    if (directWriteActive) {
+        writeSerial("WARNING: Previous direct write session was active - cleaning up before starting new session");
+        cleanupDirectWriteState(false);
+    }
     uint8_t colorScheme = globalConfig.displays[0].color_scheme;
     directWriteBitplanes = (colorScheme == 1 || colorScheme == 2); // BWR/BWY use bitplanes
     directWritePlane2 = false; // Start with plane 1
@@ -2002,9 +2145,8 @@ void handleDirectWriteStart(uint8_t* data, uint16_t len) {
             } else {
                 writeSerial("ERROR: Initial compressed data too large for static buffer (" + String(compressedDataLen) + " > " + String(MAX_IMAGE_SIZE) + ")");
                 writeSerial("Rejecting compressed upload - client should use uncompressed mode");
-                directWriteActive = false;
-                directWriteCompressed = false;
-                uint8_t errorResponse[] = {0xFF, 0xFF};  // Error response: use uncompressed upload
+                cleanupDirectWriteState(false);
+                uint8_t errorResponse[] = {0xFF, RESP_DIRECT_WRITE_ERROR};  // Error response: use uncompressed upload
                 sendResponse(errorResponse, sizeof(errorResponse));
                 return;
             }
@@ -2030,17 +2172,25 @@ void handleDirectWriteStart(uint8_t* data, uint16_t len) {
     writeSerial("Expected total bytes: " + String(directWriteTotalBytes) + (directWriteBitplanes ? " per plane" : ""));
     directWriteActive = true;
     directWriteBytesWritten = 0;
-    writeSerial("a");
+    directWriteStartTime = millis();
+    if (displayPowerState) {
+        writeSerial("WARNING: Display already powered on - powering off first to ensure clean state");
+        pwrmgm(false);
+        delay(100);  // Brief delay to ensure power down completes
+    }
     pwrmgm(true);
-    writeSerial("b");
+    writeSerial("Power management enabled");
     bbepInitIO(&bbep, globalConfig.displays[0].dc_pin, globalConfig.displays[0].reset_pin, globalConfig.displays[0].busy_pin, globalConfig.displays[0].cs_pin, globalConfig.displays[0].data_pin, globalConfig.displays[0].clk_pin, 8000000);
-    writeSerial("c");
+    writeSerial("Display IO initialized");
     bbepWakeUp(&bbep);
-    writeSerial("d");
+    writeSerial("Display woken up");
     bbepSendCMDSequence(&bbep, bbep.pInitFull);// important for some displays
+    writeSerial("Display init sequence sent");
     bbepSetAddrWindow(&bbep, 0, 0, globalConfig.displays[0].pixel_width, globalConfig.displays[0].pixel_height);
+    writeSerial("Display address window set");
     bbepStartWrite(&bbep, directWriteBitplanes ? PLANE_0 : getplane());
-    uint8_t ackResponse[] = {0x00, 0x70};
+    writeSerial("Display write started");
+    uint8_t ackResponse[] = {0x00, RESP_DIRECT_WRITE_START_ACK};
     sendResponse(ackResponse, sizeof(ackResponse));
     writeSerial("Direct write mode started, ready for data");
 }
@@ -2366,6 +2516,10 @@ void handleDirectWriteData(uint8_t* data, uint16_t len) {
                         dataOffset += bytesToWrite;
                         remainingLen -= bytesToWrite;
                     }
+                    if (remainingLen > 0 && directWriteBytesWritten >= directWriteTotalBytes) {
+                        writeSerial("WARNING: Received " + String(remainingLen) + " extra bytes after plane 1 complete - ignoring");
+                        remainingLen = 0;
+                    }
                     if (directWriteBytesWritten >= directWriteTotalBytes && !directWritePlane2) {
                         writeSerial("Plane 1 complete, switching to plane 2");
                         directWritePlane2 = true;
@@ -2383,6 +2537,10 @@ void handleDirectWriteData(uint8_t* data, uint16_t len) {
                         dataOffset += bytesToWrite;
                         remainingLen -= bytesToWrite;
                     }
+                    if (remainingLen > 0 && directWriteBytesWritten >= directWriteTotalBytes) {
+                        writeSerial("WARNING: Received " + String(remainingLen) + " extra bytes after plane 2 complete - ignoring");
+                        remainingLen = 0;
+                    }
                     if (directWriteBytesWritten >= directWriteTotalBytes) {
                         writeSerial("Plane 2 complete");
                         break;
@@ -2393,18 +2551,25 @@ void handleDirectWriteData(uint8_t* data, uint16_t len) {
                 writeSerial("All planes written, ending direct write mode");
                 handleDirectWriteEnd();
             } else {
-                uint8_t ackResponse[] = {0x00, 0x71};
+                uint8_t ackResponse[] = {0x00, RESP_DIRECT_WRITE_DATA_ACK};
                 sendResponse(ackResponse, sizeof(ackResponse));
             }
         } else {
-            bbepWriteData(&bbep, data, len);
-            directWriteBytesWritten += len;
-            writeSerial("Direct write: " + String(len) + " bytes written (total: " + String(directWriteBytesWritten) + "/" + String(directWriteTotalBytes) + ")");
+            uint32_t remainingBytes = (directWriteBytesWritten < directWriteTotalBytes) ? (directWriteTotalBytes - directWriteBytesWritten) : 0;
+            uint16_t bytesToWrite = (len > remainingBytes) ? remainingBytes : len;
+            if (bytesToWrite > 0) {
+                bbepWriteData(&bbep, data, bytesToWrite);
+                directWriteBytesWritten += bytesToWrite;
+                writeSerial("Direct write: " + String(bytesToWrite) + " bytes written (total: " + String(directWriteBytesWritten) + "/" + String(directWriteTotalBytes) + ")");
+            }
+            if (len > remainingBytes) {
+                writeSerial("WARNING: Received " + String(len) + " bytes but only " + String(remainingBytes) + " bytes expected - ignoring excess data");
+            }
             if (directWriteBytesWritten >= directWriteTotalBytes) {
                 writeSerial("All data written, ending direct write mode");
                 handleDirectWriteEnd();
             } else {
-                uint8_t ackResponse[] = {0x00, 0x71};
+                uint8_t ackResponse[] = {0x00, RESP_DIRECT_WRITE_DATA_ACK};
                 sendResponse(ackResponse, sizeof(ackResponse));
             }
         }
@@ -2416,10 +2581,7 @@ void handleDirectWriteCompressedData(uint8_t* data, uint16_t len) {
     if (newTotalSize > MAX_IMAGE_SIZE) {
         writeSerial("ERROR: Compressed data exceeds static buffer size (" + String(newTotalSize) + " > " + String(MAX_IMAGE_SIZE) + ")");
         writeSerial("Rejecting compressed upload - client should use uncompressed mode");
-        directWriteActive = false;
-        directWriteCompressed = false;
-        directWriteCompressedReceived = 0;
-        directWriteCompressedBuffer = nullptr;
+        cleanupDirectWriteState(true);
         uint8_t errorResponse[] = {0xFF, 0xFF};  // Error response: use uncompressed upload
         sendResponse(errorResponse, sizeof(errorResponse));
         return;
@@ -2427,7 +2589,7 @@ void handleDirectWriteCompressedData(uint8_t* data, uint16_t len) {
     memcpy(directWriteCompressedBuffer + directWriteCompressedReceived, data, len);
     directWriteCompressedReceived += len;
     writeSerial("Accumulated compressed data: " + String(directWriteCompressedReceived) + " bytes");
-    uint8_t ackResponse[] = {0x00, 0x71};
+    uint8_t ackResponse[] = {0x00, RESP_DIRECT_WRITE_DATA_ACK};
     sendResponse(ackResponse, sizeof(ackResponse));
 }
 
@@ -2548,6 +2710,24 @@ void decompressDirectWriteData() {
     }
 }
 
+void cleanupDirectWriteState(bool refreshDisplay) {
+    directWriteActive = false;
+    directWriteCompressed = false;
+    directWriteBitplanes = false;
+    directWritePlane2 = false;
+    directWriteBytesWritten = 0;
+    directWriteCompressedReceived = 0;
+    directWriteCompressedSize = 0;
+    directWriteDecompressedTotal = 0;
+    directWriteCompressedBuffer = nullptr;
+    directWriteWidth = 0;
+    directWriteHeight = 0;
+    directWriteTotalBytes = 0;
+    directWriteRefreshMode = 0;
+    directWriteStartTime = 0;
+    writeSerial("Direct write state cleaned up");
+}
+
 void handleDirectWriteEnd(uint8_t* data, uint16_t len) {
     if (!directWriteActive) {
         writeSerial("WARNING: Direct write end called but mode not active");
@@ -2582,24 +2762,22 @@ void handleDirectWriteEnd(uint8_t* data, uint16_t len) {
     } else {
         writeSerial("No refresh mode specified, using full refresh (backward compatible)");
     }
-    
-    bbepRefresh(&bbep, refreshMode);
-    waitforrefresh(60);
-    pwrmgm(false);
-    directWriteActive = false;
-    directWriteCompressed = false;
-    directWriteBytesWritten = 0;
-    directWriteCompressedReceived = 0;
-    directWriteCompressedSize = 0;
-    directWriteDecompressedTotal = 0;
-    directWriteCompressedBuffer = nullptr;
-    directWriteWidth = 0;
-    directWriteHeight = 0;
-    directWriteTotalBytes = 0;
-    directWriteRefreshMode = 0;  // Reset refresh mode flag
-    uint8_t ackResponse[] = {0x00, 0x72};
+    uint8_t ackResponse[] = {0x00, RESP_DIRECT_WRITE_END_ACK};
     sendResponse(ackResponse, sizeof(ackResponse));
-    writeSerial("Direct write completed and display refreshed");
+    delay(100);
+    bbepRefresh(&bbep, refreshMode);
+    bool refreshSuccess = waitforrefresh(60);
+    cleanupDirectWriteState(false);
+    pwrmgm(false);
+    if (refreshSuccess) {
+        uint8_t refreshResponse[] = {0x00, RESP_DIRECT_WRITE_REFRESH_SUCCESS};
+        sendResponse(refreshResponse, sizeof(refreshResponse));
+        writeSerial("Direct write completed and display refreshed successfully");
+    } else {
+        uint8_t timeoutResponse[] = {0x00, RESP_DIRECT_WRITE_REFRESH_TIMEOUT};
+        sendResponse(timeoutResponse, sizeof(timeoutResponse));
+        writeSerial("Direct write completed but display refresh timed out");
+    }
 }
 
 void imageDataWritten(BLEConnHandle conn_hdl, BLECharPtr chr, uint8_t* data, uint16_t len) {
