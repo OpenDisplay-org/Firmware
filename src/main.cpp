@@ -40,6 +40,9 @@ void setup() {
     writeSerial("BLE advertising started - waiting for connections...");
     initDisplay();
     writeSerial("Display initialized");
+    #ifdef TARGET_ESP32
+    initWiFi();
+    #endif
     writeSerial("=== Setup completed successfully ===");
     updatemsdata();
 }
@@ -90,6 +93,38 @@ void loop() {
             cleanupDirectWriteState(true);
         }
     }
+    #ifdef TARGET_ESP32
+    // Handle WiFi server connection and data
+    handleWiFiServer();
+    
+    // Check WiFi connection status periodically (every 10 seconds)
+    static uint32_t lastWiFiCheck = 0;
+    if (wifiInitialized && (millis() - lastWiFiCheck > 10000)) {
+        lastWiFiCheck = millis();
+        if (WiFi.status() != WL_CONNECTED && wifiConnected) {
+            writeSerial("WiFi connection lost (status: " + String(WiFi.status()) + ")");
+            wifiConnected = false;
+            if (wifiServerConnected) {
+                disconnectWiFiServer();
+            }
+        } else if (WiFi.status() == WL_CONNECTED && !wifiConnected) {
+            writeSerial("WiFi reconnected (IP: " + WiFi.localIP().toString() + ")");
+            wifiConnected = true;
+            // Reinitialize mDNS on reconnection
+            String deviceName = "OD" + getChipIdHex();
+            if (MDNS.begin(deviceName.c_str())) {
+                writeSerial("mDNS responder restarted: " + deviceName + ".local");
+            } else {
+                writeSerial("ERROR: Failed to restart mDNS responder");
+            }
+            // Attempt to reconnect to server
+            if (wifiServerConfigured) {
+                connectWiFiServer();
+            }
+        }
+    }
+    #endif
+    
     bool bleActive = (commandQueueTail != commandQueueHead) || 
                      (responseQueueTail != responseQueueHead) ||
                      (pServer && pServer->getConnectedCount() > 0);
@@ -943,6 +978,522 @@ void ble_init_esp32(bool update_manufacturer_data) {
     writeSerial("Waiting for BLE connections...");
 }
 
+void initWiFi() {
+    #ifdef TARGET_ESP32
+    writeSerial("=== Initializing WiFi ===");
+    
+    // Check if WiFi is enabled in communication modes
+    if (!(globalConfig.system_config.communication_modes & COMM_MODE_WIFI)) {
+        writeSerial("WiFi not enabled in communication_modes, skipping WiFi initialization");
+        wifiInitialized = false;
+        return;
+    }
+    
+    // Check if WiFi configuration is available
+    if (!wifiConfigured) {
+        writeSerial("WiFi configuration not available, skipping WiFi initialization");
+        wifiInitialized = false;
+        return;
+    }
+    
+    // Check if SSID is valid
+    if (wifiSsid[0] == '\0' || strlen(wifiSsid) == 0) {
+        writeSerial("WiFi SSID is empty, skipping WiFi initialization");
+        wifiInitialized = false;
+        return;
+    }
+    
+    writeSerial("WiFi enabled and configured, starting connection...");
+    writeSerial("SSID: \"" + String(wifiSsid) + "\"");
+    
+    // Disconnect any existing connection first and ensure clean state
+    WiFi.disconnect(true); // true = erase stored credentials
+    delay(500);
+    
+    // Set WiFi mode to Station (client) mode
+    // If already in STA mode, this is safe; if not, it ensures clean state
+    WiFi.mode(WIFI_OFF);
+    delay(100);
+    WiFi.mode(WIFI_STA);
+    delay(100);
+    
+    // Set hostname to match BLE device name
+    String deviceName = "OD" + getChipIdHex();
+    WiFi.setHostname(deviceName.c_str());
+    writeSerial("WiFi hostname set to: " + deviceName);
+    
+    // Configure WiFi for coexistence with BLE and reliability
+    WiFi.setSleep(false); // Disable WiFi sleep for better coexistence
+    WiFi.setAutoReconnect(true); // Enable automatic reconnection
+    
+    // Set WiFi power to maximum for better range/reliability
+    WiFi.setTxPower(WIFI_POWER_19_5dBm); // Maximum power (if supported)
+    
+    // Scan for networks first to ensure the SSID is available
+    writeSerial("Scanning for networks...");
+    int n = WiFi.scanNetworks();
+    if (n > 0) {
+        writeSerial("Found " + String(n) + " network(s)");
+        bool ssidFound = false;
+        for (int i = 0; i < n; i++) {
+            if (WiFi.SSID(i) == String(wifiSsid)) {
+                ssidFound = true;
+                writeSerial("Target SSID found, RSSI: " + String(WiFi.RSSI(i)) + " dBm");
+                break;
+            }
+        }
+        if (!ssidFound) {
+            writeSerial("WARNING: Target SSID \"" + String(wifiSsid) + "\" not found in scan");
+            writeSerial("Will attempt connection anyway (network might be hidden)");
+        }
+    } else {
+        writeSerial("No networks found in scan");
+    }
+    WiFi.scanDelete(); // Clear scan results
+    
+    // Start WiFi connection based on encryption type
+    writeSerial("Encryption type: 0x" + String(wifiEncryptionType, HEX));
+    
+    wifiConnected = false;
+    wifiInitialized = true;
+    
+    switch(wifiEncryptionType) {
+        case 0x00: // Open network (no encryption)
+            writeSerial("Connecting to open network...");
+            WiFi.begin(wifiSsid);
+            break;
+            
+        case 0x01: // WEP (deprecated, but supported)
+            writeSerial("Connecting to WEP network...");
+            if (strlen(wifiPassword) > 0) {
+                WiFi.begin(wifiSsid, wifiPassword);
+            } else {
+                WiFi.begin(wifiSsid);
+            }
+            break;
+            
+        case 0x02: // WPA
+        case 0x03: // WPA2 (most common)
+            writeSerial("Connecting to WPA/WPA2 network...");
+            if (strlen(wifiPassword) > 0) {
+                WiFi.begin(wifiSsid, wifiPassword);
+            } else {
+                writeSerial("WARNING: WPA/WPA2 network but no password provided");
+                WiFi.begin(wifiSsid);
+            }
+            break;
+            
+        case 0x04: // WPA3
+            writeSerial("Connecting to WPA3 network...");
+            if (strlen(wifiPassword) > 0) {
+                WiFi.begin(wifiSsid, wifiPassword);
+            } else {
+                writeSerial("WARNING: WPA3 network but no password provided");
+                WiFi.begin(wifiSsid);
+            }
+            break;
+            
+        default:
+            writeSerial("WARNING: Unknown encryption type, attempting connection with password...");
+            if (strlen(wifiPassword) > 0) {
+                WiFi.begin(wifiSsid, wifiPassword);
+            } else {
+                WiFi.begin(wifiSsid);
+            }
+            break;
+    }
+    
+    // Wait for connection with timeout and retry logic
+    writeSerial("Waiting for WiFi connection...");
+    const int maxRetries = 3;
+    const int maxAttemptsPerRetry = 40; // 20 seconds per retry (500ms * 40)
+    bool connected = false;
+    
+    for (int retry = 0; retry < maxRetries && !connected; retry++) {
+        if (retry > 0) {
+            writeSerial("Retry attempt " + String(retry + 1) + "/" + String(maxRetries));
+            // Disconnect and wait for WiFi to be fully disconnected before retry
+            writeSerial("Disconnecting WiFi...");
+            WiFi.disconnect(true); // true = erase stored credentials
+            delay(500);
+            
+            // Wait for WiFi to be in disconnected state (max 5 seconds)
+            int disconnectAttempts = 0;
+            while (WiFi.status() != WL_DISCONNECTED && disconnectAttempts < 10) {
+                delay(500);
+                disconnectAttempts++;
+                wl_status_t status = WiFi.status();
+                if (status == WL_DISCONNECTED) {
+                    writeSerial("WiFi disconnected successfully");
+                    break;
+                }
+            }
+            
+            if (WiFi.status() != WL_DISCONNECTED) {
+                writeSerial("WARNING: WiFi still not disconnected after 5 seconds, forcing mode change");
+                WiFi.mode(WIFI_OFF);
+                delay(500);
+                WiFi.mode(WIFI_STA);
+                delay(500);
+            }
+            
+            // Additional delay to ensure WiFi stack is ready
+            delay(1000);
+            
+            // Re-initiate connection
+            writeSerial("Initiating new connection attempt...");
+            switch(wifiEncryptionType) {
+                case 0x00:
+                    WiFi.begin(wifiSsid);
+                    break;
+                case 0x01:
+                case 0x02:
+                case 0x03:
+                case 0x04:
+                default:
+                    if (strlen(wifiPassword) > 0) {
+                        WiFi.begin(wifiSsid, wifiPassword);
+                    } else {
+                        WiFi.begin(wifiSsid);
+                    }
+                    break;
+            }
+        }
+        
+        int attempts = 0;
+        while (WiFi.status() != WL_CONNECTED && attempts < maxAttemptsPerRetry) {
+            delay(500);
+            attempts++;
+            if (attempts % 10 == 0) {
+                writeSerial("Still connecting... (" + String(attempts * 500 / 1000) + "s)");
+                // Log current status for debugging
+                wl_status_t status = WiFi.status();
+                String statusStr = "Unknown";
+                switch(status) {
+                    case WL_IDLE_STATUS: statusStr = "Idle"; break;
+                    case WL_NO_SSID_AVAIL: statusStr = "SSID not found"; break;
+                    case WL_CONNECT_FAILED: statusStr = "Connection failed"; break;
+                    case WL_CONNECTION_LOST: statusStr = "Connection lost"; break;
+                    case WL_DISCONNECTED: statusStr = "Disconnected"; break;
+                    case WL_CONNECTED: statusStr = "Connected"; break;
+                }
+                writeSerial("WiFi status: " + statusStr + " (" + String(status) + ")");
+            }
+        }
+        
+        if (WiFi.status() == WL_CONNECTED) {
+            connected = true;
+            break;
+        } else {
+            writeSerial("Connection attempt " + String(retry + 1) + " failed");
+            if (retry < maxRetries - 1) {
+                writeSerial("Will retry in 2 seconds...");
+                delay(2000);
+            }
+        }
+    }
+    
+    if (WiFi.status() == WL_CONNECTED) {
+        wifiConnected = true;
+        writeSerial("=== WiFi Connected Successfully ===");
+        writeSerial("SSID: " + String(wifiSsid));
+        writeSerial("IP Address: " + WiFi.localIP().toString());
+        writeSerial("Subnet Mask: " + WiFi.subnetMask().toString());
+        writeSerial("Gateway: " + WiFi.gatewayIP().toString());
+        writeSerial("RSSI: " + String(WiFi.RSSI()) + " dBm");
+        writeSerial("MAC Address: " + WiFi.macAddress());
+        writeSerial("Hostname: " + String(WiFi.getHostname()));
+        
+        // Initialize mDNS with the same name as BLE
+        String deviceName = "OD" + getChipIdHex();
+        writeSerial("=== Initializing mDNS ===");
+        if (MDNS.begin(deviceName.c_str())) {
+            writeSerial("mDNS responder started");
+            writeSerial("mDNS hostname: " + deviceName + ".local");
+            writeSerial("Device accessible at: http://" + deviceName + ".local");
+        } else {
+            writeSerial("ERROR: Failed to start mDNS responder");
+        }
+        
+        // Connect to TCP server if configured
+        if (wifiServerConfigured) {
+            connectWiFiServer();
+        } else {
+            writeSerial("No server configured, skipping TCP connection");
+        }
+    } else {
+        wifiConnected = false;
+        writeSerial("=== WiFi Connection Failed After " + String(maxRetries) + " Attempts ===");
+        writeSerial("Status code: " + String(WiFi.status()));
+        String statusStr = "Unknown";
+        switch(WiFi.status()) {
+            case WL_IDLE_STATUS: statusStr = "Idle"; break;
+            case WL_NO_SSID_AVAIL: statusStr = "SSID not found"; break;
+            case WL_CONNECT_FAILED: statusStr = "Connection failed"; break;
+            case WL_CONNECTION_LOST: statusStr = "Connection lost"; break;
+            case WL_DISCONNECTED: statusStr = "Disconnected"; break;
+        }
+        writeSerial("Status: " + statusStr);
+        writeSerial("WiFi auto-reconnect is enabled, will retry automatically");
+        writeSerial("You can also manually retry by rebooting the device");
+    }
+    #else
+    // Not ESP32 platform, WiFi not supported
+    writeSerial("WiFi not supported on this platform");
+    wifiInitialized = false;
+    #endif
+}
+
+#ifdef TARGET_ESP32
+void connectWiFiServer() {
+    if (!wifiConnected || WiFi.status() != WL_CONNECTED) {
+        writeSerial("WiFi not connected, cannot connect to server");
+        return;
+    }
+    
+    if (!wifiServerConfigured || wifiServerUrl[0] == '\0') {
+        writeSerial("Server not configured, skipping connection");
+        return;
+    }
+    
+    if (wifiClient.connected()) {
+        writeSerial("Already connected to server");
+        return;
+    }
+    
+    writeSerial("=== Connecting to TCP Server ===");
+    writeSerial("Server: " + String(wifiServerUrl) + ":" + String(wifiServerPort));
+    
+    wifiClient.setTimeout(10000);  // 10 second timeout
+    bool connected = wifiClient.connect(wifiServerUrl, wifiServerPort);
+    
+    if (connected) {
+        wifiServerConnected = true;
+        wifiServerLastConnectAttempt = millis();
+        writeSerial("=== TCP Server Connected Successfully ===");
+        writeSerial("Remote IP: " + wifiClient.remoteIP().toString());
+        writeSerial("Remote Port: " + String(wifiClient.remotePort()));
+        
+        // Send connection notification
+        sendConnectionNotification(0x01);  // 0x01 = connected
+    } else {
+        wifiServerConnected = false;
+        wifiServerLastConnectAttempt = millis();
+        writeSerial("=== TCP Server Connection Failed ===");
+        writeSerial("Error: " + String(wifiClient.getWriteError()));
+        writeSerial("Will retry in " + String(WIFI_SERVER_RECONNECT_DELAY / 1000) + " seconds");
+    }
+}
+
+void sendConnectionNotification(uint8_t status) {
+    if (!wifiClient.connected()) {
+        writeSerial("Cannot send connection notification - not connected");
+        return;
+    }
+    
+    writeSerial("=== Sending Connection Notification ===");
+    String deviceName = "OD" + getChipIdHex();
+    uint32_t timestamp = millis() / 1000;  // Seconds since boot
+    
+    // Build outer packet
+    uint8_t packet[1024];
+    uint32_t pos = 0;
+    
+    // Reserve space for length (will fill later)
+    uint32_t lengthPos = pos;
+    pos += 2;
+    
+    // Version
+    packet[pos++] = 0x01;
+    
+    // Single packet: connection notification (0x27)
+    packet[pos++] = 0x00;  // Packet number
+    packet[pos++] = 0x27;  // Packet ID: wifi_connection_notification
+    
+    // Payload: device name (32 bytes)
+    memset(&packet[pos], 0, 32);
+    uint8_t nameLen = deviceName.length();
+    if (nameLen > 31) nameLen = 31;
+    memcpy(&packet[pos], deviceName.c_str(), nameLen);
+    pos += 32;
+    
+    // Firmware version
+    packet[pos++] = getFirmwareMajor();
+    packet[pos++] = getFirmwareMinor();
+    
+    // Connection status
+    packet[pos++] = status;
+    
+    // Timestamp (4 bytes, little endian)
+    packet[pos++] = timestamp & 0xFF;
+    packet[pos++] = (timestamp >> 8) & 0xFF;
+    packet[pos++] = (timestamp >> 16) & 0xFF;
+    packet[pos++] = (timestamp >> 24) & 0xFF;
+    
+    // Reserved bytes (25 bytes)
+    memset(&packet[pos], 0, 25);
+    pos += 25;
+    
+    // Calculate CRC16-CCITT over packet (excluding length and CRC fields)
+    uint32_t dataLen = pos - 2;  // Length without the 2-byte length field
+    uint16_t crc = calculateCRC16CCITT(&packet[2], dataLen);
+    
+    // Add CRC
+    packet[pos++] = crc & 0xFF;
+    packet[pos++] = (crc >> 8) & 0xFF;
+    
+    // Fill in length (total packet size including CRC)
+    uint16_t totalLength = pos;
+    packet[lengthPos] = totalLength & 0xFF;
+    packet[lengthPos + 1] = (totalLength >> 8) & 0xFF;
+    
+    // Send packet
+    size_t bytesWritten = wifiClient.write(packet, pos);
+    wifiClient.flush();
+    
+    if (bytesWritten == pos) {
+        writeSerial("Connection notification sent successfully (" + String(bytesWritten) + " bytes)");
+        writeSerial("Status: " + String(status == 0x01 ? "Connected" : "Disconnected"));
+    } else {
+        writeSerial("ERROR: Failed to send complete connection notification (expected " + 
+                   String(pos) + ", wrote " + String(bytesWritten) + ")");
+    }
+}
+
+void disconnectWiFiServer() {
+    if (wifiClient.connected()) {
+        writeSerial("=== Disconnecting from TCP Server ===");
+        // Send disconnect notification before closing
+        sendConnectionNotification(0x00);  // 0x00 = disconnected
+        delay(100);  // Give time for notification to be sent
+        wifiClient.stop();
+        wifiServerConnected = false;
+        writeSerial("TCP connection closed");
+    }
+}
+
+void handleWiFiServer() {
+    if (!wifiConnected || WiFi.status() != WL_CONNECTED) {
+        if (wifiServerConnected) {
+            writeSerial("WiFi disconnected, closing TCP connection");
+            disconnectWiFiServer();
+        }
+        return;
+    }
+    
+    // Check if we need to connect
+    if (!wifiServerConnected && wifiServerConfigured) {
+        uint32_t now = millis();
+        if (now - wifiServerLastConnectAttempt >= WIFI_SERVER_RECONNECT_DELAY) {
+            connectWiFiServer();
+        }
+        return;
+    }
+    
+    if (!wifiClient.connected()) {
+        if (wifiServerConnected) {
+            writeSerial("TCP connection lost");
+            wifiServerConnected = false;
+            wifiServerLastConnectAttempt = millis();
+        }
+        return;
+    }
+    
+    // Check for incoming data
+    int available = wifiClient.available();
+    if (available > 0) {
+        // Read data into buffer
+        int bytesToRead = available;
+        if (tcpReceiveBufferPos + bytesToRead > sizeof(tcpReceiveBuffer)) {
+            bytesToRead = sizeof(tcpReceiveBuffer) - tcpReceiveBufferPos;
+            writeSerial("WARNING: Receive buffer full, truncating data");
+        }
+        
+        int bytesRead = wifiClient.read(&tcpReceiveBuffer[tcpReceiveBufferPos], bytesToRead);
+        if (bytesRead > 0) {
+            tcpReceiveBufferPos += bytesRead;
+            
+            // Try to parse complete outer packets
+            uint32_t parsePos = 0;
+            while (parsePos + 5 <= tcpReceiveBufferPos) {  // Need at least 5 bytes (length + version + min packet)
+                // Read packet length
+                uint16_t packetLength = tcpReceiveBuffer[parsePos] | (tcpReceiveBuffer[parsePos + 1] << 8);
+                
+                if (packetLength < 5 || packetLength > sizeof(tcpReceiveBuffer)) {
+                    writeSerial("ERROR: Invalid packet length: " + String(packetLength));
+                    // Skip this byte and try again
+                    parsePos++;
+                    continue;
+                }
+                
+                // Check if we have complete packet
+                if (parsePos + packetLength > tcpReceiveBufferPos) {
+                    // Incomplete packet, wait for more data
+                    break;
+                }
+                
+                // We have a complete packet, process it
+                writeSerial("Received TCP packet: " + String(packetLength) + " bytes");
+                
+                // Parse outer packet to extract command
+                uint32_t packetOffset = parsePos + 2;  // Skip length field
+                if (packetLength < 5) {
+                    writeSerial("ERROR: Packet too short");
+                    parsePos++;
+                    continue;
+                }
+                
+                // Read version
+                uint8_t version = tcpReceiveBuffer[packetOffset++];
+                if (version != 0x01) {
+                    writeSerial("ERROR: Unsupported protocol version: " + String(version));
+                    parsePos += packetLength;
+                    continue;
+                }
+                
+                // Parse single packets
+                uint32_t dataEnd = parsePos + packetLength - 2;  // Exclude CRC (last 2 bytes)
+                uint32_t currentOffset = packetOffset;
+                
+                while (currentOffset + 2 <= dataEnd) {
+                    uint8_t packetNumber = tcpReceiveBuffer[currentOffset++];
+                    uint8_t packetId = tcpReceiveBuffer[currentOffset++];
+                    
+                    // Get payload (everything until CRC)
+                    uint16_t payloadLen = dataEnd - currentOffset;
+                    uint8_t* payload = &tcpReceiveBuffer[currentOffset];
+                    
+                    // For command packets, payload format is: [status:1][cmd:2][data:variable]
+                    // imageDataWritten expects: [cmd_high:1][cmd_low:1][data:variable]
+                    // So we need to skip the status byte
+                    if (payloadLen >= 3) {
+                        // Skip status byte (payload[0]) and pass rest to imageDataWritten
+                        imageDataWritten(NULL, NULL, payload + 1, payloadLen - 1);
+                    } else {
+                        writeSerial("ERROR: Payload too short: " + String(payloadLen));
+                    }
+                    
+                    // Only process first packet for now
+                    break;
+                }
+                
+                // Move to next packet
+                parsePos += packetLength;
+            }
+            
+            // Move remaining data to start of buffer
+            if (parsePos > 0) {
+                uint32_t remaining = tcpReceiveBufferPos - parsePos;
+                if (remaining > 0) {
+                    memmove(tcpReceiveBuffer, &tcpReceiveBuffer[parsePos], remaining);
+                }
+                tcpReceiveBufferPos = remaining;
+            }
+        }
+    }
+}
+#endif
+
 void minimalSetup() {
     writeSerial("=== Minimal Setup (Deep Sleep Wake) ===");
     full_config_init();
@@ -1380,7 +1931,7 @@ void reboot(){
 }
 
 void sendResponse(uint8_t* response, uint8_t len){
-    writeSerial("Sending BLE response:");
+    writeSerial("Sending response:");
     writeSerial("  Length: " + String(len) + " bytes");
     writeSerial("  Command: 0x" + String(response[0], HEX) + String(response[1], HEX));
     String hexDump = "  Full command: ";
@@ -1390,12 +1941,55 @@ void sendResponse(uint8_t* response, uint8_t len){
         hexDump += String(response[i], HEX);
     }
     writeSerial(hexDump);
-    #ifdef TARGET_NRF
-    imageCharacteristic.notify(response, len);
-    writeSerial("Response notified (nRF52)");
-    #endif
+    
     #ifdef TARGET_ESP32
-    // Queue response to avoid calling notify() from callback context
+    // Send over TCP if connected
+    if (wifiServerConnected && wifiClient.connected()) {
+        // Wrap response in outer packet format for TCP
+        uint8_t tcpPacket[1024];
+        uint32_t pos = 0;
+        
+        // Reserve space for length (will fill later)
+        uint32_t lengthPos = pos;
+        pos += 2;
+        
+        // Version
+        tcpPacket[pos++] = 0x01;
+        
+        // Response as single packet
+        // Packet structure: number (1 byte) + id (1 byte) + payload
+        tcpPacket[pos++] = 0x00;  // Packet number
+        // For responses, use a response packet ID (0x80 + command byte)
+        // Or use the command byte from response[1] as the packet ID
+        uint8_t responsePacketId = (len > 1) ? response[1] : 0x00;
+        tcpPacket[pos++] = responsePacketId;
+        
+        // Copy entire response as payload (status + command + data)
+        memcpy(&tcpPacket[pos], response, len);
+        pos += len;
+        
+        // Calculate CRC16-CCITT over packet data (excluding length and CRC fields)
+        uint32_t dataLen = pos - 2;
+        uint16_t crc = calculateCRC16CCITT(&tcpPacket[2], dataLen);
+        tcpPacket[pos++] = crc & 0xFF;
+        tcpPacket[pos++] = (crc >> 8) & 0xFF;
+        
+        // Fill in length (total packet size including CRC)
+        uint16_t totalLength = pos;
+        tcpPacket[lengthPos] = totalLength & 0xFF;
+        tcpPacket[lengthPos + 1] = (totalLength >> 8) & 0xFF;
+        
+        // Send over TCP
+        size_t bytesWritten = wifiClient.write(tcpPacket, pos);
+        wifiClient.flush();
+        if (bytesWritten == pos) {
+            writeSerial("TCP response sent (" + String(bytesWritten) + " bytes)");
+        } else {
+            writeSerial("ERROR: TCP response incomplete (expected " + String(pos) + ", wrote " + String(bytesWritten) + ")");
+        }
+    }
+    
+    // Queue response for BLE to avoid calling notify() from callback context
     if (len <= MAX_RESPONSE_SIZE) {
         uint8_t nextHead = (responseQueueHead + 1) % RESPONSE_QUEUE_SIZE;
         if (nextHead != responseQueueTail) {
@@ -1553,6 +2147,23 @@ uint32_t calculateConfigCRC(uint8_t* data, uint32_t len){
         }
     }
     return ~crc;
+}
+
+// CRC16-CCITT for TCP packets (polynomial 0x1021)
+uint16_t calculateCRC16CCITT(uint8_t* data, uint32_t len){
+    uint16_t crc = 0xFFFF;
+    for (uint32_t i = 0; i < len; i++) {
+        crc ^= (data[i] << 8);
+        for (int j = 0; j < 8; j++) {
+            if (crc & 0x8000) {
+                crc = (crc << 1) ^ 0x1021;
+            } else {
+                crc = crc << 1;
+            }
+            crc &= 0xFFFF;
+        }
+    }
+    return crc;
 }
 
 void handleReadConfig(){
@@ -1743,6 +2354,13 @@ bool loadGlobalConfig(){
     wifiSsid[0] = '\0';
     wifiPassword[0] = '\0';
     wifiEncryptionType = 0;
+    #ifdef TARGET_ESP32
+    wifiServerUrl[0] = '\0';
+    wifiServerPort = 2446;  // Default port
+    wifiServerConfigured = false;
+    wifiServerConnected = false;
+    tcpReceiveBufferPos = 0;
+    #endif
     static uint8_t configData[MAX_CONFIG_SIZE];
     static uint32_t configLen = MAX_CONFIG_SIZE;
     if (!loadConfig(configData, &configLen)) {
@@ -1878,7 +2496,82 @@ bool loadGlobalConfig(){
                         while (passwordLen < 32 && wifiPassword[passwordLen] != '\0') passwordLen++;
                         offset += 32;
                         wifiEncryptionType = configData[offset++];
-                        offset += 95;
+                        #ifdef TARGET_ESP32
+                        // Parse server configuration from reserved bytes
+                        // First, read as string (like SSID)
+                        memcpy(wifiServerUrl, &configData[offset], 64);
+                        wifiServerUrl[64] = '\0';  // Ensure null termination
+                        
+                        // Check if it's stored as a string (has null terminator in first few bytes)
+                        // or as a 4-byte IP address (numeric format from config tool)
+                        bool isStringFormat = false;
+                        for (int i = 0; i < 64; i++) {
+                            if (wifiServerUrl[i] == '\0') {
+                                isStringFormat = true;
+                                break;
+                            }
+                            // If we find a non-printable character (except null), it's likely binary
+                            if (i > 0 && wifiServerUrl[i] < 32 && wifiServerUrl[i] != '\0') {
+                                break;
+                            }
+                        }
+                        
+                        // If first 4 bytes look like an IP address in numeric format (little-endian)
+                        // and there's no null terminator in first 5 bytes, convert to IP string
+                        // Check if bytes 0-3 are non-zero and byte 4 is null (indicating 4-byte format)
+                        if (!isStringFormat && wifiServerUrl[4] == '\0' && 
+                            (wifiServerUrl[0] != 0 || wifiServerUrl[1] != 0 || 
+                             wifiServerUrl[2] != 0 || wifiServerUrl[3] != 0)) {
+                            // The config tool stores IP as 32-bit integer in little-endian format
+                            // Bytes are: [byte0][byte1][byte2][byte3] = IP address
+                            // Convert 4-byte IP (stored as little-endian) to string format
+                            uint8_t ip[4];
+                            ip[0] = configData[offset];
+                            ip[1] = configData[offset + 1];
+                            ip[2] = configData[offset + 2];
+                            ip[3] = configData[offset + 3];
+                            snprintf(wifiServerUrl, 65, "%d.%d.%d.%d", ip[0], ip[1], ip[2], ip[3]);
+                            writeSerial("Converted numeric IP to string: \"" + String(wifiServerUrl) + "\"");
+                        } else if (!isStringFormat && wifiServerUrl[0] != '\0') {
+                            // Try to interpret as 32-bit integer (little-endian) and convert to IP
+                            uint32_t ipNum = (uint32_t)configData[offset] | 
+                                            ((uint32_t)configData[offset + 1] << 8) |
+                                            ((uint32_t)configData[offset + 2] << 16) |
+                                            ((uint32_t)configData[offset + 3] << 24);
+                            // Convert to IP string (interpret as big-endian IP address)
+                            uint8_t ip[4];
+                            ip[0] = (ipNum >> 24) & 0xFF;
+                            ip[1] = (ipNum >> 16) & 0xFF;
+                            ip[2] = (ipNum >> 8) & 0xFF;
+                            ip[3] = ipNum & 0xFF;
+                            snprintf(wifiServerUrl, 65, "%d.%d.%d.%d", ip[0], ip[1], ip[2], ip[3]);
+                            writeSerial("Converted 32-bit integer to IP string: \"" + String(wifiServerUrl) + "\"");
+                        }
+                        
+                        offset += 64;
+                        // Read port (2 bytes, network byte order)
+                        wifiServerPort = (configData[offset] << 8) | configData[offset + 1];
+                        offset += 2;
+                        
+                        // Check if server is configured (URL not empty and not "0.0.0.0")
+                        wifiServerConfigured = (wifiServerUrl[0] != '\0' && 
+                                               strcmp(wifiServerUrl, "0.0.0.0") != 0);
+                        if (wifiServerConfigured) {
+                            writeSerial("Server configured: YES");
+                            writeSerial("Server URL: \"" + String(wifiServerUrl) + "\"");
+                            writeSerial("Server Port: " + String(wifiServerPort));
+                        } else {
+                            writeSerial("Server configured: NO");
+                            if (wifiServerUrl[0] == '\0') {
+                                writeSerial("Reason: URL is empty");
+                            } else if (strcmp(wifiServerUrl, "0.0.0.0") == 0) {
+                                writeSerial("Reason: URL is \"0.0.0.0\"");
+                            }
+                        }
+                        offset += 29;  // Skip remaining reserved bytes
+                        #else
+                        offset += 95;  // Skip all reserved bytes on non-ESP32
+                        #endif
                         wifiConfigured = true;
                         writeSerial("=== WiFi Configuration Loaded ===");
                         writeSerial("SSID: \"" + String(wifiSsid) + "\"");
@@ -1934,6 +2627,27 @@ void printConfigSummary(){
     writeSerial("--- System Configuration ---");
     writeSerial("IC Type: 0x" + String(globalConfig.system_config.ic_type, HEX));
     writeSerial("Communication Modes: 0x" + String(globalConfig.system_config.communication_modes, HEX));
+    writeSerial("  BLE: " + String((globalConfig.system_config.communication_modes & COMM_MODE_BLE) ? "enabled" : "disabled"));
+    writeSerial("  OEPL: " + String((globalConfig.system_config.communication_modes & COMM_MODE_OEPL) ? "enabled" : "disabled"));
+    writeSerial("  WiFi: " + String((globalConfig.system_config.communication_modes & COMM_MODE_WIFI) ? "enabled" : "disabled"));
+    #ifdef TARGET_ESP32
+    if (globalConfig.system_config.communication_modes & COMM_MODE_WIFI) {
+        if (wifiConfigured) {
+            writeSerial("  WiFi SSID: \"" + String(wifiSsid) + "\"");
+            if (wifiInitialized) {
+                if (wifiConnected) {
+                    writeSerial("  WiFi Status: Connected (IP: " + WiFi.localIP().toString() + ")");
+                } else {
+                    writeSerial("  WiFi Status: Disconnected");
+                }
+            } else {
+                writeSerial("  WiFi Status: Not initialized");
+            }
+        } else {
+            writeSerial("  WiFi Status: Configured but not loaded");
+        }
+    }
+    #endif
     writeSerial("Device Flags: 0x" + String(globalConfig.system_config.device_flags, HEX));
     writeSerial("  PWR_PIN flag: " + String((globalConfig.system_config.device_flags & DEVICE_FLAG_PWR_PIN) ? "enabled" : "disabled"));
     #ifdef TARGET_NRF

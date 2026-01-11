@@ -58,6 +58,11 @@ using namespace Adafruit_LittleFS_Namespace;
 #define RESP_CONFIG_WRITE             0x41  // Config write response
 #define RESP_CONFIG_CHUNK             0x42  // Config chunk response
 
+// Communication mode bit definitions (for system_config.communication_modes)
+#define COMM_MODE_BLE           (1 << 0)  // Bit 0: BLE transfer supported
+#define COMM_MODE_OEPL          (1 << 1)  // Bit 1: OEPL based transfer supported
+#define COMM_MODE_WIFI          (1 << 2)  // Bit 2: WiFi transfer supported
+
 // Device flags bit definitions (for system_config.device_flags)
 #define DEVICE_FLAG_PWR_PIN      (1 << 0)  // Bit 0: Device has external power management pin
 #define DEVICE_FLAG_XIAOINIT     (1 << 1)  // Bit 1: Call xiaoinit() after config load (nRF52840 only)
@@ -89,6 +94,8 @@ extern "C" {
 #include <BLEAdvertising.h>
 #include <esp_system.h>
 #include "esp_sleep.h"
+#include <WiFi.h>
+#include <ESPmDNS.h>
 
 extern BLEServer* pServer;
 extern BLEService* pService;
@@ -131,6 +138,20 @@ char wifiSsid[33] = {0};  // 32 bytes + null terminator
 char wifiPassword[33] = {0};  // 32 bytes + null terminator
 uint8_t wifiEncryptionType = 0;  // 0x00=none, 0x01=WEP, 0x02=WPA, 0x03=WPA2, 0x04=WPA3
 bool wifiConfigured = false;  // True if WiFi config packet (0x26) was received and parsed
+#ifdef TARGET_ESP32
+#include <WiFiClient.h>
+bool wifiConnected = false;  // True if WiFi is currently connected
+bool wifiInitialized = false;  // True if WiFi initialization was attempted
+char wifiServerUrl[65] = {0};  // 64 bytes + null terminator for server URL/hostname
+uint16_t wifiServerPort = 2446;  // Default server port
+bool wifiServerConfigured = false;  // True if server URL is configured
+WiFiClient wifiClient;  // TCP client connection
+bool wifiServerConnected = false;  // True if TCP connection to server is established
+uint32_t wifiServerLastConnectAttempt = 0;  // Timestamp of last connection attempt
+const uint32_t WIFI_SERVER_RECONNECT_DELAY = 30000;  // 30 seconds between reconnect attempts
+uint8_t tcpReceiveBuffer[8192];  // TCP receive buffer
+uint32_t tcpReceiveBufferPos = 0;  // Current position in receive buffer
+#endif
 
 // Direct write mode state (bufferless display writing)
 bool directWriteActive = false;  // True when direct write mode is active
@@ -190,12 +211,20 @@ void readAXP2101Data();
 void powerDownAXP2101();
 void updatemsdata();
 void ble_init();
+#ifdef TARGET_ESP32
+void initWiFi();
+void connectWiFiServer();
+void handleWiFiServer();
+void sendConnectionNotification(uint8_t status);
+void disconnectWiFiServer();
+#endif
 void full_config_init();
 void formatConfigStorage();
 bool initConfigStorage();
 bool saveConfig(uint8_t* configData, uint32_t len);
 bool loadConfig(uint8_t* configData, uint32_t* len);
 uint32_t calculateConfigCRC(uint8_t* data, uint32_t len);
+uint16_t calculateCRC16CCITT(uint8_t* data, uint32_t len);
 void handleReadConfig();
 void handleWriteConfig(uint8_t* data, uint16_t len);
 void handleWriteConfigChunk(uint8_t* data, uint16_t len);
