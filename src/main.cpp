@@ -1838,6 +1838,7 @@ void initDisplay(){
     String chipId = getChipIdHex();
     String infoText = "opendisplay.org\nName: OD" + chipId + "\nFW: " + String(getFirmwareMajor()) + "." + String(getFirmwareMinor()) + "\nFirmware by\nJonas Niesner";
     if (! (globalConfig.displays[0].transmission_modes & TRANSMISSION_MODE_CLEAR_ON_BOOT)){
+    writeTextAndFill(infoText.c_str());    
     bbepRefresh(&bbep, REFRESH_FULL);
     waitforrefresh(60);
     }
