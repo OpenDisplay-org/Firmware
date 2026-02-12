@@ -43,8 +43,9 @@ void setup() {
     #ifdef TARGET_ESP32
     initWiFi();
     #endif
-    writeSerial("=== Setup completed successfully ===");
     updatemsdata();
+    initButtons();
+    writeSerial("=== Setup completed successfully ===");
 }
 
 void loop() {
@@ -84,7 +85,6 @@ void loop() {
         responseQueue[responseQueueTail].pending = false;
         responseQueueTail = (responseQueueTail + 1) % RESPONSE_QUEUE_SIZE;
         writeSerial("Response sent successfully");
-        //delay(20); // Brief delay to let BLE stack process
     }
     if (directWriteActive && directWriteStartTime > 0) {
         uint32_t directWriteDuration = millis() - directWriteStartTime;
@@ -137,19 +137,20 @@ void loop() {
     bool bleActive = (commandQueueTail != commandQueueHead) || 
                      (responseQueueTail != responseQueueHead) ||
                      (pServer && pServer->getConnectedCount() > 0);
-    
     if (bleActive) {
+      // Check for button events in fast loop
         delay(1);
     } else {
         if (!woke_from_deep_sleep && deep_sleep_count == 0 && globalConfig.power_option.power_mode == 1) {
             if (!firstBootDelayInitialized) {
                 firstBootDelayInitialized = true;
                 firstBootDelayStart = millis();
+                processButtonEvents();
                 writeSerial("First boot: waiting 60s before entering deep sleep");
             }
             uint32_t elapsed = millis() - firstBootDelayStart;
             if (elapsed < 60000) {
-                delay(5);
+                idleDelay(5);
                 return;
             }
             writeSerial("First boot delay elapsed, deep sleep permitted");
@@ -158,41 +159,264 @@ void loop() {
             enterDeepSleep();
         }
         else{
-            delay(2000);
+            idleDelay(2000);
         }
+        processButtonEvents();
         if(!bleActive)writeSerial("Loop end: " + String(millis() / 100));
     }
     #else
     if(globalConfig.power_option.sleep_timeout_ms > 0){
-        uint32_t remainingDelay = globalConfig.power_option.sleep_timeout_ms;
-        const uint32_t CHECK_INTERVAL_MS = 100;
-        while(remainingDelay > 0){
-            uint32_t chunkDelay = (remainingDelay > CHECK_INTERVAL_MS) ? CHECK_INTERVAL_MS : remainingDelay;
-            delay(chunkDelay);
-            remainingDelay -= chunkDelay;
-        }
+        idleDelay(globalConfig.power_option.sleep_timeout_ms);
         updatemsdata();
     }
     else{
-        delay(500);
+        idleDelay(500);
     }
     writeSerial("Loop end: " + String(millis() / 100));
     #endif
 }
 
+void processButtonEvents() {
+    if (buttonEventPending) {
+        buttonEventPending = false; 
+        uint32_t currentTime = millis();
+        uint8_t changedButtonIndex = lastChangedButtonIndex;
+        lastChangedButtonIndex = 0xFF;  
+        writeSerial("Button event pending: " + String(changedButtonIndex));
+        if (changedButtonIndex < MAX_BUTTONS && buttonStates[changedButtonIndex].initialized) {
+            ButtonState* btn = &buttonStates[changedButtonIndex];
+            if (btn->current_state == 1) {
+                bool resetCount = false;
+                if (btn->last_press_time == 0 || currentTime - btn->last_press_time > 5000) {
+                    resetCount = true;  // First press or more than 5 seconds since last press
+                }
+                if (btn->last_press_time > 0) {
+                    for (uint8_t j = 0; j < buttonStateCount; j++) {
+                        if (j != changedButtonIndex && buttonStates[j].initialized && 
+                            buttonStates[j].last_press_time > 0 &&  // Has been pressed before
+                            buttonStates[j].last_press_time > btn->last_press_time &&  // Pressed more recently than this button
+                            (currentTime - buttonStates[j].last_press_time) < 5000) {  // Within 5 seconds
+                            resetCount = true;  // Another button was pressed more recently
+                            break;
+                        }
+                    }
+                }
+                if (resetCount) {
+                    for (uint8_t j = 0; j < buttonStateCount; j++) {
+                        if (buttonStates[j].initialized) {
+                            buttonStates[j].press_count = 0;
+                        }
+                    }
+                    btn->press_count = 1;
+                }
+                btn->last_press_time = currentTime;
+            }
+        }
+        if (changedButtonIndex < MAX_BUTTONS && buttonStates[changedButtonIndex].initialized) {
+            ButtonState* btn = &buttonStates[changedButtonIndex];
+            bool pinState = digitalRead(btn->pin);
+            bool logicalPressed = btn->inverted ? !pinState : pinState;
+            writeSerial("Pin state: " + String(pinState) + ", Logical pressed: " + String(logicalPressed) + ",inverted: " + String(btn->inverted));
+            uint8_t logicalState = logicalPressed ? 1 : 0;
+            btn->current_state = logicalState;
+            writeSerial("Button: " + String(btn->button_id) + ", Press count: " + String(btn->press_count) + ", Current state: " + String(btn->current_state));
+            uint8_t buttonData = (btn->button_id & 0x07) |                    // Bits 0-2: button_id
+                                 ((btn->press_count & 0x0F) << 3) |           // Bits 3-6: press_count (4 bits, 0-15)
+                                 ((btn->current_state & 0x01) << 7);          // Bit 7: current_state (logical, with inversion)
+            if (btn->byte_index < 11) {
+                dynamicreturndata[btn->byte_index] = buttonData;
+            }
+        }
+        updatemsdata();
+    }
+}
+
+void flashLed(uint8_t color, uint8_t brightness) {
+    if (activeLedInstance == 0xFF) {
+        for (uint8_t i = 0; i < globalConfig.led_count; i++) {
+            if (globalConfig.leds[i].led_type == 1) {  // RGB LED type
+                activeLedInstance = i;
+                break;
+            }
+        }
+        if (activeLedInstance == 0xFF) {
+            return;  // No RGB LED configured
+        }
+    }
+    struct LedConfig* led = &globalConfig.leds[activeLedInstance];
+    uint8_t ledRedPin = led->led_1_r;
+    uint8_t ledGreenPin = led->led_2_g;
+    uint8_t ledBluePin = led->led_3_b;
+    bool invertRed = (led->led_flags & 0x01) != 0;
+    bool invertGreen = (led->led_flags & 0x02) != 0;
+    bool invertBlue = (led->led_flags & 0x04) != 0;
+    uint8_t colorred = (color >> 5) & 0b00000111;
+    uint8_t colorgreen = (color >> 2) & 0b00000111;
+    uint8_t colorblue = color & 0b00000011;
+    for (uint16_t i = 0; i < brightness; i++) {
+        digitalWrite(ledRedPin, invertRed ? !(colorred >= 7) : (colorred >= 7));
+        digitalWrite(ledGreenPin, invertGreen ? !(colorgreen >= 7) : (colorgreen >= 7));
+        digitalWrite(ledBluePin, invertBlue ? !(colorblue >= 3) : (colorblue >= 3));
+        delayMicroseconds(100);
+        digitalWrite(ledRedPin, invertRed ? !(colorred >= 1) : (colorred >= 1));
+        digitalWrite(ledGreenPin, invertGreen ? !(colorgreen >= 1) : (colorgreen >= 1));
+        delayMicroseconds(100);
+        digitalWrite(ledRedPin, invertRed ? !(colorred >= 6) : (colorred >= 6));
+        digitalWrite(ledGreenPin, invertGreen ? !(colorgreen >= 6) : (colorgreen >= 6));
+        digitalWrite(ledBluePin, invertBlue ? !(colorblue >= 1) : (colorblue >= 1));
+        delayMicroseconds(100);
+        digitalWrite(ledRedPin, invertRed ? !(colorred >= 2) : (colorred >= 2));
+        digitalWrite(ledGreenPin, invertGreen ? !(colorgreen >= 2) : (colorgreen >= 2));
+        delayMicroseconds(100);
+        digitalWrite(ledRedPin, invertRed ? !(colorred >= 5) : (colorred >= 5));
+        digitalWrite(ledGreenPin, invertGreen ? !(colorgreen >= 5) : (colorgreen >= 5));
+        delayMicroseconds(100);
+        digitalWrite(ledRedPin, invertRed ? !(colorred >= 3) : (colorred >= 3));
+        digitalWrite(ledGreenPin, invertGreen ? !(colorgreen >= 3) : (colorgreen >= 3));
+        digitalWrite(ledBluePin, invertBlue ? !(colorblue >= 2) : (colorblue >= 2));
+        delayMicroseconds(100);
+        digitalWrite(ledRedPin, invertRed ? !(colorred >= 4) : (colorred >= 4));
+        digitalWrite(ledGreenPin, invertGreen ? !(colorgreen >= 4) : (colorgreen >= 4));
+        delayMicroseconds(100);
+        digitalWrite(ledRedPin, invertRed ? HIGH : LOW);
+        digitalWrite(ledGreenPin, invertGreen ? HIGH : LOW);
+        digitalWrite(ledBluePin, invertBlue ? HIGH : LOW);
+    }
+}
+
+void ledFlashLogic() {
+    writeSerial("=== ledFlashLogic START ===");
+    writeSerial("ledFlashActive: " + String(ledFlashActive ? "true" : "false"));
+    writeSerial("activeLedInstance: 0x" + String(activeLedInstance, HEX));
+    writeSerial("led_count: " + String(globalConfig.led_count));
+    if (!ledFlashActive) {
+        writeSerial("LED flash not active, returning");
+        return;
+    }
+    if (activeLedInstance == 0xFF) {
+        writeSerial("Searching for RGB LED...");
+        for (uint8_t i = 0; i < globalConfig.led_count; i++) {
+            writeSerial("LED[" + String(i) + "]: type=" + String(globalConfig.leds[i].led_type));
+            if (globalConfig.leds[i].led_type == 1) {  // RGB LED type
+                activeLedInstance = i;
+                writeSerial("Found RGB LED at instance " + String(i));
+                break;
+            }
+        }
+        if (activeLedInstance == 0xFF) {
+            writeSerial("ERROR: No RGB LED configured");
+            return;
+        }
+    }
+    struct LedConfig* led = &globalConfig.leds[activeLedInstance];
+    uint8_t* ledcfg = led->reserved;
+    uint8_t brightness = ((ledcfg[0] >> 4) & 0x0F) + 1;  // Bits 4-7: brightness (1-16)
+    uint8_t mode = ledcfg[0] & 0x0F;  // Bits 0-3: mode
+    writeSerial("Brightness: " + String(brightness) + " (from bits 4-7: " + String((ledcfg[0] >> 4) & 0x0F) + ")");
+    writeSerial("Mode: " + String(mode) + " (from bits 0-3)");
+    if (mode == 1) {
+        writeSerial("Mode 1: Flash pattern enabled");
+        const uint8_t interloopdelayfactor = 100;
+        const uint8_t loopdelayfactor = 100;
+        uint8_t c1 = ledcfg[1];
+        uint8_t c2 = ledcfg[4];
+        uint8_t c3 = ledcfg[7];
+        uint8_t loop1delay = (ledcfg[2] >> 4) & 0x0F;
+        uint8_t loop2delay = (ledcfg[5] >> 4) & 0x0F;
+        uint8_t loop3delay = (ledcfg[8] >> 4) & 0x0F;
+        uint8_t loopcnt1 = ledcfg[2] & 0x0F;
+        uint8_t loopcnt2 = ledcfg[5] & 0x0F;
+        uint8_t loopcnt3 = ledcfg[8] & 0x0F;
+        uint8_t ildelay1 = ledcfg[3];
+        uint8_t ildelay2 = ledcfg[6];
+        uint8_t ildelay3 = ledcfg[9];
+        uint8_t grouprepeats = ledcfg[10] + 1;
+        writeSerial("Loop 1: color=0x" + String(c1, HEX) + " count=" + String(loopcnt1) + 
+                    " delay=" + String(loop1delay) + " inter=" + String(ildelay1));
+        writeSerial("Loop 2: color=0x" + String(c2, HEX) + " count=" + String(loopcnt2) + 
+                    " delay=" + String(loop2delay) + " inter=" + String(ildelay2));
+        writeSerial("Loop 3: color=0x" + String(c3, HEX) + " count=" + String(loopcnt3) + 
+                    " delay=" + String(loop3delay) + " inter=" + String(ildelay3));
+        writeSerial("Group repeats: " + String(grouprepeats) + " (255 = infinite)");
+        while (ledFlashActive) {
+            if (ledFlashPosition >= grouprepeats && grouprepeats != 255) {
+                writeSerial("Group repeats reached (" + String(grouprepeats) + "), stopping");
+                brightness = 0;
+                ledcfg[0] = 0x00;  // Disable mode
+                ledFlashPosition = 0;
+                break;
+            }
+            writeSerial("Group repeat " + String(ledFlashPosition + 1) + "/" + String(grouprepeats == 255 ? "inf" : String(grouprepeats)));
+            for (int i = 0; i < loopcnt1; i++) {
+                flashLed(c1, brightness);
+                delay(loop1delay * loopdelayfactor);
+            }
+            delay(ildelay1 * interloopdelayfactor);
+            for (int i = 0; i < loopcnt2; i++) {
+                flashLed(c2, brightness);
+                delay(loop2delay * loopdelayfactor);
+            }
+            delay(ildelay2 * interloopdelayfactor);
+            for (int i = 0; i < loopcnt3; i++) {
+                flashLed(c3, brightness);
+                delay(loop3delay * loopdelayfactor);
+            }
+            delay(ildelay3 * interloopdelayfactor);
+            
+            ledFlashPosition++;
+        }
+        writeSerial("Flash pattern completed");
+    } else {
+        writeSerial("Mode 0 or disabled, nothing to do");
+    }
+    writeSerial("=== ledFlashLogic END ===");
+}
+
+void idleDelay(uint32_t delayMs) {
+    const uint32_t CHECK_INTERVAL_MS = 100;
+    uint32_t remainingDelay = delayMs;
+    while (remainingDelay > 0) {
+        processButtonEvents();
+        uint32_t chunkDelay = (remainingDelay > CHECK_INTERVAL_MS) ? CHECK_INTERVAL_MS : remainingDelay;
+        delay(chunkDelay);
+        remainingDelay -= chunkDelay;
+    }
+}
+
 void initio(){
     if(globalConfig.led_count > 0){
-    pinMode(globalConfig.leds[0].led_1_r, OUTPUT);
-    pinMode(globalConfig.leds[0].led_2_g, OUTPUT);
-    pinMode(globalConfig.leds[0].led_3_b, OUTPUT);
-    delay(100);
-    digitalWrite(globalConfig.leds[0].led_1_r, LOW);
-    digitalWrite(globalConfig.leds[0].led_2_g, LOW);
-    digitalWrite(globalConfig.leds[0].led_3_b, LOW);
-    delay(100);
-    digitalWrite(globalConfig.leds[0].led_1_r, HIGH);
-    digitalWrite(globalConfig.leds[0].led_2_g, HIGH);
-    digitalWrite(globalConfig.leds[0].led_3_b, HIGH);
+        for (uint8_t i = 0; i < globalConfig.led_count; i++) {
+            struct LedConfig* led = &globalConfig.leds[i];
+            bool invertRed = (led->led_flags & 0x01) != 0;
+            bool invertGreen = (led->led_flags & 0x02) != 0;
+            bool invertBlue = (led->led_flags & 0x04) != 0;
+            bool invertLed4 = (led->led_flags & 0x08) != 0;
+                if (led->led_1_r != 0xFF) {
+                    pinMode(led->led_1_r, OUTPUT);
+                    digitalWrite(led->led_1_r, invertRed ? HIGH : LOW);
+                }
+                if (led->led_2_g != 0xFF) {
+                    pinMode(led->led_2_g, OUTPUT);
+                    digitalWrite(led->led_2_g, invertGreen ? HIGH : LOW);
+                }
+                if (led->led_3_b != 0xFF) {
+                    pinMode(led->led_3_b, OUTPUT);
+                    digitalWrite(led->led_3_b, invertBlue ? HIGH : LOW);
+                }
+                if (led->led_4 != 0xFF) {
+                    pinMode(led->led_4, OUTPUT);
+                    digitalWrite(led->led_4, invertLed4 ? HIGH : LOW);
+                }
+        }
+        for (uint8_t i = 0; i < globalConfig.led_count; i++) {
+            if (globalConfig.leds[i].led_type == 0) {
+                activeLedInstance = i;
+                flashLed(0xE0, 15);
+                flashLed(0x1C, 15);
+                flashLed(0x03, 15);
+                flashLed(0xFF, 15);
+            }
+        }
     }
     if(globalConfig.system_config.pwr_pin != 0xFF){
     pinMode(globalConfig.system_config.pwr_pin, OUTPUT);
@@ -203,6 +427,146 @@ void initio(){
     }
     initDataBuses();
     initSensors();
+}
+
+#ifdef TARGET_NRF
+uint8_t pinToButtonIndex[64] = {0xFF};  // Map pin number to button index (max 64 pins)
+#endif
+
+#ifdef TARGET_ESP32
+void IRAM_ATTR handleButtonISR(uint8_t buttonIndex) {
+#else
+void handleButtonISR(uint8_t buttonIndex) {
+#endif
+    if (buttonIndex >= MAX_BUTTONS || !buttonStates[buttonIndex].initialized) {
+        return;
+    }
+    ButtonState* btn = &buttonStates[buttonIndex];
+    bool pinState = digitalRead(btn->pin);
+    bool pressed = btn->inverted ? !pinState : pinState;
+    uint8_t newState = pressed ? 1 : 0;
+    if (newState != btn->current_state) {
+        btn->current_state = newState;
+        lastChangedButtonIndex = buttonIndex;
+        if (pressed) {
+            if (btn->press_count < 15) {
+                btn->press_count++;
+            }
+        }
+        buttonEventPending = true;
+    }
+}
+
+#ifdef TARGET_ESP32
+void IRAM_ATTR buttonISR(void* arg) {
+    uint8_t buttonIndex = (uint8_t)(uintptr_t)arg;
+    handleButtonISR(buttonIndex);
+}
+#elif defined(TARGET_NRF)
+void buttonISRGeneric() {
+    for (uint8_t i = 0; i < buttonStateCount; i++) {
+        if (buttonStates[i].initialized) {
+            ButtonState* btn = &buttonStates[i];
+            bool pinState = digitalRead(btn->pin);
+            bool pressed = btn->inverted ? !pinState : pinState;
+            uint8_t newState = pressed ? 1 : 0;
+            if (newState != btn->current_state) {
+                handleButtonISR(i);
+                break;
+            }
+        }
+    }
+}
+#endif
+
+void initButtons() {
+    writeSerial("=== Initializing Buttons ===");
+    buttonStateCount = 0;
+    for (uint8_t i = 0; i < MAX_BUTTONS; i++) {
+        buttonStates[i].initialized = false;
+        buttonStates[i].button_id = 0;
+        buttonStates[i].press_count = 0;
+        buttonStates[i].last_press_time = 0;
+        buttonStates[i].current_state = 0;
+        buttonStates[i].byte_index = 0xFF;
+        buttonStates[i].pin = 0xFF;
+        buttonStates[i].instance_index = 0xFF;
+    }
+    if (globalConfig.binary_input_count == 0) {
+        writeSerial("No binary inputs configured");
+        return;
+    }
+    for (uint8_t instanceIdx = 0; instanceIdx < globalConfig.binary_input_count; instanceIdx++) {
+        struct BinaryInputs* input = &globalConfig.binary_inputs[instanceIdx];
+        if (input->input_type != 1) {
+            continue;
+        }
+        if (input->button_data_byte_index > 10) {
+            writeSerial("WARNING: BinaryInputs instance " + String(instanceIdx) + " has invalid byte_index (" + String(input->button_data_byte_index) + "), skipping");
+            continue;
+        }
+        uint8_t* instancePins[8] = {
+            &input->reserved_pin_1,
+            &input->reserved_pin_2,
+            &input->reserved_pin_3,
+            &input->reserved_pin_4,
+            &input->reserved_pin_5,
+            &input->reserved_pin_6,
+            &input->reserved_pin_7,
+            &input->reserved_pin_8
+        };
+        for (uint8_t pinIdx = 0; pinIdx < 8; pinIdx++) {
+            uint8_t pin = *instancePins[pinIdx];
+            if (pin == 0xFF) {
+                continue;
+            }
+            if (buttonStateCount >= MAX_BUTTONS) {
+                writeSerial("WARNING: Maximum button count (" + String(MAX_BUTTONS) + ") reached, skipping remaining pins");
+                break;
+            }
+            ButtonState* btn = &buttonStates[buttonStateCount];
+            btn->button_id = (input->instance_number * 8) + pinIdx;
+            if (btn->button_id > 7) {
+                btn->button_id = btn->button_id % 8;  // Wrap to 0-7 for encoding
+            }
+            btn->byte_index = input->button_data_byte_index;
+            btn->pin = pin;
+            btn->instance_index = instanceIdx;
+            btn->press_count = 0;
+            btn->last_press_time = 0;
+            btn->pin_offset = pinIdx;  // Cache pin offset for ISR
+            btn->inverted = (input->invert & (1 << pinIdx)) != 0;  // Cache invert flag for ISR
+            pinMode(pin, INPUT);
+            bool hasPullup = (input->pullups & (1 << pinIdx)) != 0;
+            #ifdef TARGET_ESP32
+            bool hasPulldown = (input->pulldowns & (1 << pinIdx)) != 0;
+            if (hasPullup) {
+                pinMode(pin, INPUT_PULLUP);
+            } else if (hasPulldown) {
+                pinMode(pin, INPUT_PULLDOWN);
+            }
+            #elif defined(TARGET_NRF)
+            if (hasPullup) {
+                pinMode(pin, INPUT_PULLUP);
+            }
+            #endif
+            delay(10);  // Small delay to let pin settle
+            bool initialPinState = digitalRead(pin);
+            bool initialPressed = btn->inverted ? !initialPinState : initialPinState;
+            btn->current_state = initialPressed ? 1 : 0;
+            #ifdef TARGET_ESP32
+            attachInterruptArg(pin, buttonISR, (void*)(uintptr_t)buttonStateCount, CHANGE);
+            #elif defined(TARGET_NRF)
+            attachInterrupt(pin, buttonISRGeneric, CHANGE);
+            writeSerial("nRF: Attached interrupt to pin " + String(pin) + " (button index " + String(buttonStateCount) + ")");
+            #endif
+            btn->initialized = true;
+            buttonStateCount++;
+            writeSerial("Button initialized: instance=" + String(instanceIdx) + ", pin_idx=" + String(pinIdx) + ", pin=" + String(pin) + ", byte_index=" + String(btn->byte_index) + ", button_id=" + String(btn->button_id));
+        }
+    }
+    
+    writeSerial("Total buttons initialized: " + String(buttonStateCount));
 }
 
 uint8_t getFirmwareMajor(){
@@ -275,7 +639,6 @@ void initDataBuses(){
                 writeSerial("NOTE: nRF52840 using default I2C pins (config pins: SCL=" + String(bus->pin_1) + ", SDA=" + String(bus->pin_2) + ")");
                 #endif
                 writeSerial("I2C bus " + String(i) + " initialized: SCL=pin" + String(bus->pin_1) + ", SDA=pin" + String(bus->pin_2) + ", Speed=" + String(busSpeed) + "Hz");
-                //scanI2CDevices();
             } else {
                 writeSerial("WARNING: I2C bus " + String(i) + " configured but not initialized (only first bus supported)");
                 writeSerial("  SCL=pin" + String(bus->pin_1) + ", SDA=pin" + String(bus->pin_2) + ", Speed=" + String(busSpeed) + "Hz");
@@ -336,9 +699,6 @@ void initSensors(){
         writeSerial("  Bus ID: " + String(sensor->bus_id));
         if(sensor->sensor_type == 0x0003){ // AXP2101 PMIC
             writeSerial("  Detected AXP2101 PMIC sensor");
-            //initAXP2101(sensor->bus_id);
-            //delay(100);
-            //readAXP2101Data();
         }
         else if(sensor->sensor_type == 0x0001){ // Temperature sensor
             writeSerial("  Temperature sensor (initialization not implemented)");
@@ -776,25 +1136,39 @@ void updatemsdata(){
     float chipTemperature = readChipTemperature();
     writeSerial("Battery voltage: " + String(batteryVoltage) + "V");
     writeSerial("Chip temperature: " + String(chipTemperature) + "C");
-    uint8_t chiptemp8 = (uint8_t)chipTemperature;
     uint16_t batteryVoltageMv = (uint16_t)(batteryVoltage * 1000);
-    uint8_t batterymvvoltage8_high = (uint8_t)(batteryVoltageMv >> 8);
-    uint8_t batterymvvoltage8_low = (uint8_t)(batteryVoltageMv & 0xFF);
-uint8_t msd_payload[13];
+    // Convert to 10mV steps and clamp to 9 bits (0-511, max 5.11V)
+    uint16_t batteryVoltage10mv = batteryVoltageMv / 10;
+    if (batteryVoltage10mv > 511) {
+        batteryVoltage10mv = 511;  // Clamp to maximum 9-bit value
+    }
+    // Encode temperature in byte 13 with 0.5°C accuracy
+    // Range: -40°C to +87.5°C, encoding: (temperature + 40) * 2
+    // This gives: -40°C = 0, 0°C = 80, +87.5°C = 255
+    int16_t tempEncoded = (int16_t)((chipTemperature + 40.0f) * 2.0f);
+    if (tempEncoded < 0) {
+        tempEncoded = 0;  // Clamp to minimum (-40°C)
+    } else if (tempEncoded > 255) {
+        tempEncoded = 255;  // Clamp to maximum (+87.5°C)
+    }
+    uint8_t temperatureByte = (uint8_t)tempEncoded;
+    // Encode battery voltage lower 8 bits (byte 14): Battery voltage in 10mV steps, lower 8 bits
+    uint8_t batteryVoltageLowByte = (uint8_t)(batteryVoltage10mv & 0xFF);
+    // Encode status byte (byte 15): Battery voltage MSB (B) + Reboot flag (I) + Connection requested (C) + RFU (1 bit) + mloopcounter (4 bits)
+    // Format: B I C RFU R R R R
+    uint8_t statusByte = ((batteryVoltage10mv >> 8) & 0x01) |           // Bit 0: Battery voltage MSB
+                         ((rebootFlag & 0x01) << 1) |                     // Bit 1: Reboot flag
+                         ((connectionRequested & 0x01) << 2) |            // Bit 2: Connection requested (reserved for future features)
+                         ((mloopcounter & 0x0F) << 4);                    // Bits 4-7: mloopcounter (4 bits)
+                                                                          // Bit 3: RFU (reserved, set to 0)
+uint8_t msd_payload[16];
 uint16_t msd_cid = 0x2446;
 memset(msd_payload, 0, sizeof(msd_payload));
 memcpy(msd_payload, (uint8_t*)&msd_cid, sizeof(msd_cid));
-msd_payload[2] = 0x02;
-msd_payload[3] = 0x36;
-msd_payload[4] = 0x00;
-msd_payload[5] = 0x6C;
-msd_payload[6] = 0x00;
-msd_payload[7] = 0xC3;
-msd_payload[8] = 0x01;
-msd_payload[9] = batterymvvoltage8_low;
-msd_payload[10] = batterymvvoltage8_high;
-msd_payload[11] = chiptemp8;
-msd_payload[12] = mloopcounter;
+memcpy(&msd_payload[2], dynamicreturndata, sizeof(dynamicreturndata)); 
+msd_payload[13] = temperatureByte;      // Temperature with 0.5°C accuracy (-40°C to +87.5°C)
+msd_payload[14] = batteryVoltageLowByte; // Battery voltage lower 8 bits (10mV steps)
+msd_payload[15] = statusByte;            // Battery voltage MSB + Reboot flag + Connection requested + RFU + mloopcounter
 #ifdef TARGET_NRF
 Bluefruit.Advertising.clearData();
 Bluefruit.Advertising.addFlags(BLE_GAP_ADV_FLAGS_LE_ONLY_GENERAL_DISC_MODE);
@@ -808,8 +1182,8 @@ Bluefruit.Advertising.start(0);
 #ifdef TARGET_ESP32
 if (advertisementData != nullptr) {
         String manufacturerDataStr;
-        manufacturerDataStr.reserve(13);
-        for (int i = 0; i < 13; i++) {
+        manufacturerDataStr.reserve(16);
+        for (int i = 0; i < 16; i++) {
             manufacturerDataStr += (char)msd_payload[i];
         }
         advertisementData->setManufacturerData(manufacturerDataStr);
@@ -850,6 +1224,7 @@ if (advertisementData != nullptr) {
 }
 #endif
 mloopcounter++;
+mloopcounter &= 0x0F;  // Wrap mloopcounter to 4 bits (0-15)
 writeSerial("MSD data updated: " + String(mloopcounter));
 }
 
@@ -1002,7 +1377,6 @@ void initWiFi() {
         return;
     }
     writeSerial("SSID: \"" + String(wifiSsid) + "\"");
-    //writeSerial("Password: " + String(strlen(wifiPassword) > 0 ? "\"" + String(wifiPassword) + "\"" : "(empty)"));
     String deviceName = "OD" + getChipIdHex();
     WiFi.setAutoReconnect(true);
     WiFi.setTxPower(WIFI_POWER_15dBm);
@@ -1167,10 +1541,8 @@ void discoverAndConnectWiFiServer() {
         writeSerial("Remote IP: " + wifiClient.remoteIP().toString());
         writeSerial("Remote Port: " + String(wifiClient.remotePort()));
         sendConnectionNotification(0x01);  // 0x01 = connected
-        delay(100);  // Brief delay to ensure connection is stable
-        // Send Image Request immediately on connection (next request time will be set by server response)
-        wifiNextImageRequestTime = 0;  // Send immediately
-        // Reset poll interval to default (will be updated by server response)
+        delay(100);
+        wifiNextImageRequestTime = 0;
         wifiPollInterval = 60;
         sendImageRequest();
     } else {
@@ -1219,7 +1591,7 @@ void sendConnectionNotification(uint8_t status) {
     packet[lengthPos] = totalLength & 0xFF;
     packet[lengthPos + 1] = (totalLength >> 8) & 0xFF;
     size_t bytesWritten = wifiClient.write(packet, pos);
-    wifiClient.flush(); 
+    // Note: flush() is deprecated, TCP sockets send data immediately
     if (bytesWritten == pos) {
         writeSerial("Connection notification sent successfully (" + String(bytesWritten) + " bytes)");
         writeSerial("Status: " + String(status == 0x01 ? "Connected" : "Disconnected"));
@@ -1283,7 +1655,7 @@ void sendDisplayAnnouncement() {
     packet[lengthPos] = totalLength & 0xFF;
     packet[lengthPos + 1] = (totalLength >> 8) & 0xFF;
     size_t bytesWritten = wifiClient.write(packet, pos);
-    wifiClient.flush();  // Keep flush() for compatibility, clear() doesn't flush output
+    // Note: flush() is deprecated, TCP sockets send data immediately
     if (bytesWritten == pos) {
         writeSerial("Display Announcement sent successfully (" + String(bytesWritten) + " bytes)");
     } else {
@@ -1330,7 +1702,7 @@ void sendImageRequest() {
     packet[lengthPos] = totalLength & 0xFF;
     packet[lengthPos + 1] = (totalLength >> 8) & 0xFF;
     size_t bytesWritten = wifiClient.write(packet, pos);
-    wifiClient.flush();
+    // Note: flush() is deprecated, TCP sockets send data immediately
     if (bytesWritten == pos) {
         writeSerial("Image Request sent successfully (" + String(bytesWritten) + " bytes)");
         writeSerial("Battery: " + String(batteryPercent == 0xFF ? "AC" : String(batteryPercent) + "%") + ", RSSI: " + String(rssi) + " dBm");
@@ -1698,13 +2070,6 @@ bool powerDownExternalFlash(uint8_t mosiPin, uint8_t misoPin, uint8_t sckPin, ui
     }
     jedecIdStr.toUpperCase();
     writeSerial("JEDEC ID before: " + jedecIdStr + " (Manufacturer=0x" + String(jedecId[0], HEX) + ", MemoryType=0x" + String(jedecId[1], HEX) + ", Capacity=0x" + String(jedecId[2], HEX) + ")");
-    bool flashResponding = false;
-    for (int i = 0; i < 3; i++) {
-        if (jedecId[i] != 0xFF) {
-            flashResponding = true;
-            break;
-        }
-    }
     delay(1);
     writeSerial("Sending deep power-down command (0xB9)...");
     digitalWrite(csPin, LOW);
@@ -1728,15 +2093,6 @@ bool powerDownExternalFlash(uint8_t mosiPin, uint8_t misoPin, uint8_t sckPin, ui
     }
     jedecIdAfterStr.toUpperCase();
     writeSerial("JEDEC ID after: " + jedecIdAfterStr + " (byte[0]=0x" + String(jedecIdAfter[0], HEX) + ", byte[1]=0x" + String(jedecIdAfter[1], HEX) + ", byte[2]=0x" + String(jedecIdAfter[2], HEX) + ")");
-    bool inPowerDown = true;
-    String mismatchBytes = "";
-    for (int i = 0; i < 3; i++) {
-        if (jedecIdAfter[i] != 0xFF) {
-            inPowerDown = false;
-            if (mismatchBytes.length() > 0) mismatchBytes += ", ";
-            mismatchBytes += "byte[" + String(i) + "]=0x" + String(jedecIdAfter[i], HEX) + " (expected 0xFF)";
-        }
-    }
     }
     digitalWrite(csPin, HIGH);
     pinMode(wpPin, INPUT);
@@ -1838,7 +2194,7 @@ void initDisplay(){
     String chipId = getChipIdHex();
     String infoText = "opendisplay.org\nName: OD" + chipId + "\nFW: " + String(getFirmwareMajor()) + "." + String(getFirmwareMinor()) + "\nFirmware by\nJonas Niesner";
     if (! (globalConfig.displays[0].transmission_modes & TRANSMISSION_MODE_CLEAR_ON_BOOT)){
-    writeTextAndFill(infoText.c_str());    
+    writeTextAndFill(infoText.c_str());
     bbepRefresh(&bbep, REFRESH_FULL);
     waitforrefresh(60);
     }
@@ -1872,6 +2228,8 @@ bool waitforrefresh(int timeout){
 
 void connect_callback(uint16_t conn_handle) {
     writeSerial("=== BLE CLIENT CONNECTED ===");
+    rebootFlag = 0;  // Clear reboot flag after BLE connection established
+    updatemsdata();  // Update advertising data with cleared flag
 }
 
 void disconnect_callback(uint16_t conn_handle, uint8_t reason) {
@@ -1952,7 +2310,7 @@ void sendResponse(uint8_t* response, uint8_t len){
         tcpPacket[lengthPos] = totalLength & 0xFF;
         tcpPacket[lengthPos + 1] = (totalLength >> 8) & 0xFF;
         size_t bytesWritten = wifiClient.write(tcpPacket, pos);
-        wifiClient.flush();
+        // Note: flush() is deprecated, TCP sockets send data immediately
         if (bytesWritten == pos) {
             writeSerial("TCP response sent (" + String(bytesWritten) + " bytes)");
         } else {
@@ -1975,7 +2333,6 @@ void sendResponse(uint8_t* response, uint8_t len){
     }
     #endif
     #ifdef TARGET_NRF
-    // NRF devices send BLE notifications directly
     if (Bluefruit.connected() && imageCharacteristic.notifyEnabled()) {
         imageCharacteristic.notify(response, len);
         writeSerial("NRF: BLE notification sent (" + String(len) + " bytes)");
@@ -2124,7 +2481,6 @@ uint32_t calculateConfigCRC(uint8_t* data, uint32_t len){
     return ~crc;
 }
 
-// CRC16-CCITT for TCP packets (polynomial 0x1021)
 uint16_t calculateCRC16CCITT(uint8_t* data, uint32_t len){
     uint16_t crc = 0xFFFF;
     for (uint32_t i = 0; i < len; i++) {
@@ -2329,13 +2685,6 @@ bool loadGlobalConfig(){
     wifiSsid[0] = '\0';
     wifiPassword[0] = '\0';
     wifiEncryptionType = 0;
-    #ifdef TARGET_ESP32
-    wifiServerUrl[0] = '\0';
-    wifiServerPort = 2446;  // Default port
-    wifiServerConfigured = false;
-    wifiServerConnected = false;
-    tcpReceiveBufferPos = 0;
-    #endif
     static uint8_t configData[MAX_CONFIG_SIZE];
     static uint32_t configLen = MAX_CONFIG_SIZE;
     if (!loadConfig(configData, &configLen)) {
@@ -2405,6 +2754,8 @@ bool loadGlobalConfig(){
                     memcpy(&globalConfig.leds[globalConfig.led_count], &configData[offset], sizeof(struct LedConfig));
                     offset += sizeof(struct LedConfig);
                     globalConfig.led_count++;
+                    // Reset active LED instance to re-detect RGB LEDs after config change
+                    activeLedInstance = 0xFF;
                 } else if (globalConfig.led_count >= 4) {
                     writeSerial("WARNING: Maximum LED count reached, skipping");
                     offset += sizeof(struct LedConfig);
@@ -2602,7 +2953,6 @@ void printConfigSummary(){
     writeSerial("Version: " + String(globalConfig.version) + "." + String(globalConfig.minor_version));
     writeSerial("Loaded: " + String(globalConfig.loaded ? "Yes" : "No"));
     writeSerial("");
-    // System Config
     writeSerial("--- System Configuration ---");
     writeSerial("IC Type: 0x" + String(globalConfig.system_config.ic_type, HEX));
     writeSerial("Communication Modes: 0x" + String(globalConfig.system_config.communication_modes, HEX));
@@ -2635,13 +2985,11 @@ void printConfigSummary(){
     writeSerial("  WS_PP_INIT flag: " + String((globalConfig.system_config.device_flags & DEVICE_FLAG_WS_PP_INIT) ? "enabled" : "disabled"));
     writeSerial("Power Pin: " + String(globalConfig.system_config.pwr_pin));
     writeSerial("");
-    // Manufacturer Data
     writeSerial("--- Manufacturer Data ---");
     writeSerial("Manufacturer ID: 0x" + String(globalConfig.manufacturer_data.manufacturer_id, HEX));
     writeSerial("Board Type: " + String(globalConfig.manufacturer_data.board_type));
     writeSerial("Board Revision: " + String(globalConfig.manufacturer_data.board_revision));
     writeSerial("");
-    // Power Option
     writeSerial("--- Power Configuration ---");
     writeSerial("Power Mode: " + String(globalConfig.power_option.power_mode));
     writeSerial("Battery Capacity: " + String(globalConfig.power_option.battery_capacity_mah[0]) + 
@@ -2658,7 +3006,6 @@ void printConfigSummary(){
     writeSerial("Voltage Scaling Factor: " + String(globalConfig.power_option.voltage_scaling_factor));
     writeSerial("Deep Sleep Current: " + String(globalConfig.power_option.deep_sleep_current_ua) + " uA");
     writeSerial("");
-    // Displays
     writeSerial("--- Display Configurations (" + String(globalConfig.display_count) + ") ---");
     for (int i = 0; i < globalConfig.display_count; i++) {
         writeSerial("Display " + String(i) + ":");
@@ -2684,7 +3031,6 @@ void printConfigSummary(){
         writeSerial("    CLEAR_ON_BOOT: " + String((globalConfig.displays[i].transmission_modes & TRANSMISSION_MODE_CLEAR_ON_BOOT) ? "enabled" : "disabled"));
         writeSerial("");
     }
-    // LEDs
     writeSerial("--- LED Configurations (" + String(globalConfig.led_count) + ") ---");
     for (int i = 0; i < globalConfig.led_count; i++) {
         writeSerial("LED " + String(i) + ":");
@@ -2697,7 +3043,6 @@ void printConfigSummary(){
         writeSerial("  Flags: 0x" + String(globalConfig.leds[i].led_flags, HEX));
         writeSerial("");
     }
-    // Sensors
     writeSerial("--- Sensor Configurations (" + String(globalConfig.sensor_count) + ") ---");
     for (int i = 0; i < globalConfig.sensor_count; i++) {
         writeSerial("Sensor " + String(i) + ":");
@@ -2706,7 +3051,6 @@ void printConfigSummary(){
         writeSerial("  Bus ID: " + String(globalConfig.sensors[i].bus_id));
         writeSerial("");
     }
-    // Data Buses
     writeSerial("--- Data Bus Configurations (" + String(globalConfig.data_bus_count) + ") ---");
     for (int i = 0; i < globalConfig.data_bus_count; i++) {
         writeSerial("Data Bus " + String(i) + ":");
@@ -2725,7 +3069,6 @@ void printConfigSummary(){
         writeSerial("  Pulldowns: 0x" + String(globalConfig.data_buses[i].pulldowns, HEX));
         writeSerial("");
     }
-    // Binary Inputs
     writeSerial("--- Binary Input Configurations (" + String(globalConfig.binary_input_count) + ") ---");
     for (int i = 0; i < globalConfig.binary_input_count; i++) {
         writeSerial("Binary Input " + String(i) + ":");
@@ -3418,6 +3761,8 @@ void cleanupDirectWriteState(bool refreshDisplay) {
     directWriteTotalBytes = 0;
     directWriteRefreshMode = 0;
     directWriteStartTime = 0;
+    displayPowerState = false;
+    pwrmgm(false);
     writeSerial("Direct write state cleaned up");
 }
 
@@ -3461,7 +3806,6 @@ void handleDirectWriteEnd(uint8_t* data, uint16_t len) {
     bbepRefresh(&bbep, refreshMode);
     bool refreshSuccess = waitforrefresh(60);
     cleanupDirectWriteState(false);
-    pwrmgm(false);
     if (refreshSuccess) {
         uint8_t refreshResponse[] = {0x00, RESP_DIRECT_WRITE_REFRESH_SUCCESS};
         sendResponse(refreshResponse, sizeof(refreshResponse));
@@ -3515,10 +3859,99 @@ void imageDataWritten(BLEConnHandle conn_hdl, BLECharPtr chr, uint8_t* data, uin
             writeSerial("=== DIRECT WRITE END COMMAND (0x0072) ===");
             handleDirectWriteEnd(data + 2, len - 2);  // Pass data after command bytes (2 bytes for command)
             break;
+        case 0x0073: // LED Activate command
+            writeSerial("=== LED ACTIVATE COMMAND (0x0073) ===");
+            handleLedActivate(data + 2, len - 2);
+            break;
         default:
             writeSerial("ERROR: Unknown command: 0x" + String(command, HEX));
             writeSerial("Expected: 0x0011 (read config), 0x0064 (image info), 0x0065 (block data), or 0x0003 (finalize)");
             break;
     }
     writeSerial("Command processing completed successfully");
+}
+
+void handleLedActivate(uint8_t* data, uint16_t len) {
+    writeSerial("=== handleLedActivate START ===");
+    writeSerial("Command length: " + String(len) + " bytes");
+    // LED activation command format:
+    // data[0]: LED instance number (0-based index)
+    // data[1-12]: LED flash config (12 bytes, same format as reserved[0-11] in LedConfig)
+    // If len == 1, only instance is provided (use existing config for that instance)
+    // If len == 13, both instance and config are provided
+    if (len < 1) {
+        writeSerial("ERROR: LED activate command too short (len=" + String(len) + ", need at least 1 byte for instance)");
+        uint8_t errorResponse[] = {0xFF, 0x73, 0x01, 0x00};  // Error, command, error code, no data
+        sendResponse(errorResponse, sizeof(errorResponse));
+        return;
+    }
+    uint8_t ledInstance = data[0];
+    writeSerial("LED instance: " + String(ledInstance));
+    String dataHex = "Data bytes: ";
+    for (uint16_t i = 0; i < len && i < 20; i++) {
+        if (i > 0) dataHex += " ";
+        if (data[i] < 0x10) dataHex += "0";
+        dataHex += String(data[i], HEX);
+    }
+    if (len > 20) dataHex += " ...";
+    writeSerial(dataHex);
+    writeSerial("Current activeLedInstance: 0x" + String(activeLedInstance, HEX));
+    writeSerial("Current led_count: " + String(globalConfig.led_count));
+    if (ledInstance >= globalConfig.led_count) {
+        writeSerial("ERROR: LED instance " + String(ledInstance) + " out of range (led_count=" + String(globalConfig.led_count) + ")");
+        uint8_t errorResponse[] = {0xFF, 0x73, 0x02, 0x00};  // Error, command, error code, no data
+        sendResponse(errorResponse, sizeof(errorResponse));
+        return;
+    }
+    struct LedConfig* led = &globalConfig.leds[ledInstance];
+    activeLedInstance = ledInstance;
+    writeSerial("Using LED instance " + String(ledInstance));
+    writeSerial("LED config: type=" + String(led->led_type) + 
+                " R=" + String(led->led_1_r) + 
+                " G=" + String(led->led_2_g) + 
+                " B=" + String(led->led_3_b));
+    uint8_t* ledcfg = led->reserved;
+    String currentCfg = "Current LED config: ";
+    for (uint8_t i = 0; i < 12; i++) {
+        if (i > 0) currentCfg += " ";
+        if (ledcfg[i] < 0x10) currentCfg += "0";
+        currentCfg += String(ledcfg[i], HEX);
+    }
+    writeSerial(currentCfg);
+    if (len >= 13) {
+        writeSerial("Updating LED flash config from command data...");
+        memcpy(ledcfg, data + 1, 12);
+        String newCfg = "New LED config: ";
+        for (uint8_t i = 0; i < 12; i++) {
+            if (i > 0) newCfg += " ";
+            if (ledcfg[i] < 0x10) newCfg += "0";
+            newCfg += String(ledcfg[i], HEX);
+        }
+        writeSerial(newCfg);
+        uint8_t modeByte = ledcfg[0];
+        uint8_t mode = modeByte & 0x0F;
+        uint8_t brightnessRaw = (modeByte >> 4) & 0x0F;
+        uint8_t brightness = brightnessRaw + 1;
+        writeSerial("Mode byte 0x" + String(modeByte, HEX) + " decoded: mode=" + String(mode) + 
+                    " brightness=" + String(brightness) + " (raw=" + String(brightnessRaw) + ")");
+        if (mode == 0) {
+            writeSerial("WARNING: Mode is 0 (disabled)! Set bit 0 to 1 for mode 1.");
+            writeSerial("Example: 0x80 -> 0x81 (mode=1, brightness=8)");
+        }
+        
+        writeSerial("LED flash config updated");
+    } else {
+        writeSerial("No config provided (len=" + String(len) + "), using existing config");
+    }
+    writeSerial("Activating LED flash (runs indefinitely until group repeats complete)");
+    ledFlashActive = true;
+    ledFlashPosition = 0;
+    writeSerial("Calling ledFlashLogic()...");
+    ledFlashLogic();
+    writeSerial("ledFlashLogic returned");
+    ledFlashActive = false;
+    uint8_t successResponse[] = {0x00, 0x73, 0x00, 0x00};  // Success, command, no error, no data
+    sendResponse(successResponse, sizeof(successResponse));
+    writeSerial("LED flash completed, response sent");
+    writeSerial("=== handleLedActivate END ===");
 }

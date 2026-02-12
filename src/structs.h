@@ -137,7 +137,8 @@ struct BinaryInputs {
     uint8_t invert;             // Invert flags per pin (bitfield)
     uint8_t pullups;            // Internal pullup resistors per pin (bitfield)
     uint8_t pulldowns;          // Internal pulldown resistors per pin (bitfield)
-    uint8_t reserved[15];       // Reserved bytes for future use
+    uint8_t button_data_byte_index;  // Byte index in dynamicreturndata (0-10) for button data
+    uint8_t reserved[14];       // Reserved bytes for future use
 } __attribute__((packed));
 
 // Global configuration structure

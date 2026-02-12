@@ -93,6 +93,8 @@ extern "C" {
 #include <BLEUtils.h>
 #include <BLEAdvertising.h>
 #include <esp_system.h>
+#include <esp_mac.h>
+#include <esp_timer.h>
 #include "esp_sleep.h"
 #include <WiFi.h>
 #include <ESPmDNS.h>
@@ -127,6 +129,32 @@ uint8_t decompressionChunk[DECOMP_CHUNK_SIZE];
 uint8_t dictionaryBuffer[MAX_DICT_SIZE];
 uint8_t bleResponseBuffer[94];
 uint8_t mloopcounter = 0;
+uint8_t rebootFlag = 1;  // Set to 1 after reboot, cleared to 0 after BLE connection
+uint8_t connectionRequested = 0;  // Reserved for future features (connection requested flag)
+uint8_t dynamicreturndata[11] = {0};  // Dynamic return data blocks (bytes 2-12 in advertising payload)
+
+// Button state tracking structure
+struct ButtonState {
+    uint8_t button_id;          // Button ID (0-7, from instance_number + pin offset)
+    uint8_t press_count;         // Press count (0-15)
+    volatile uint32_t last_press_time;    // Timestamp of last press (millis, updated in ISR)
+    volatile uint8_t current_state;       // Current button state (0=released, 1=pressed, updated in ISR)
+    uint8_t byte_index;          // Byte index in dynamicreturndata
+    uint8_t pin;                 // GPIO pin number
+    uint8_t instance_index;      // BinaryInputs instance index
+    bool initialized;          // Whether this button is initialized
+    uint8_t pin_offset;         // Pin offset within instance (0-7) for faster ISR lookup
+    bool inverted;              // Inverted flag for this pin (cached for ISR)
+};
+
+#define MAX_BUTTONS 32  // Up to 4 instances * 8 pins = 32 buttons max
+ButtonState buttonStates[MAX_BUTTONS] = {0};  // Button state tracking
+uint8_t buttonStateCount = 0;  // Number of initialized buttons
+volatile bool buttonEventPending = false;  // Flag set by ISR to indicate button event
+volatile uint8_t lastChangedButtonIndex = 0xFF;  // Index of button that last changed (set by ISR)
+uint8_t ledFlashPosition = 0;  // Current position in LED flash pattern group
+uint8_t activeLedInstance = 0xFF;  // LED instance index for flashing (0xFF = none configured)
+bool ledFlashActive = false;  // Flag to indicate if LED flashing is active (set by command)
 
 // Static buffers for writeTextAndFill() to avoid dynamic allocation
 // Maximum pitch: 1360px / 2 = 680 bytes (4BPP), line buffer: 256 bytes
@@ -207,6 +235,18 @@ void imageDataWritten(BLEConnHandle conn_hdl, BLECharPtr chr, uint8_t* data, uin
 void sendResponse(uint8_t* response, uint8_t len);
 void initio();
 void initDataBuses();
+void initButtons();
+void handleButtonPress(uint8_t buttonIndex);
+void processButtonEvents();  // Process button events and update BLE data
+void idleDelay(uint32_t delayMs);  // Non-blocking delay that processes buttons at 100ms intervals
+void flashLed(uint8_t color, uint8_t brightness);  // Flash LED with color and brightness
+void ledFlashLogic();  // LED flashing logic with pattern support (runs indefinitely)
+void handleLedActivate(uint8_t* data, uint16_t len);  // Handle LED activation command
+#ifdef TARGET_ESP32
+void handleButtonISR(uint8_t buttonIndex);  // Shared ISR handler (IRAM_ATTR in implementation)
+#else
+void handleButtonISR(uint8_t buttonIndex);  // Shared ISR handler
+#endif
 void scanI2CDevices();
 void initSensors();
 void initAXP2101(uint8_t busId);
@@ -354,6 +394,8 @@ uint8_t commandQueueTail = 0;
 class MyBLEServerCallbacks : public BLEServerCallbacks {
     void onConnect(BLEServer* pServer) {
         writeSerial("=== BLE CLIENT CONNECTED (ESP32) ===");
+        rebootFlag = 0;  // Clear reboot flag after BLE connection established
+        updatemsdata();  // Update advertising data with cleared flag
     }
     void onDisconnect(BLEServer* pServer) {
         writeSerial("=== BLE CLIENT DISCONNECTED (ESP32) ===");
