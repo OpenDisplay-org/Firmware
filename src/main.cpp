@@ -161,6 +161,7 @@ void loop() {
         else{
             idleDelay(2000);
         }
+        updatemsdata();
         processButtonEvents();
         if(!bleActive)writeSerial("Loop end: " + String(millis() / 100));
     }
@@ -1161,14 +1162,14 @@ void updatemsdata(){
                          ((connectionRequested & 0x01) << 2) |            // Bit 2: Connection requested (reserved for future features)
                          ((mloopcounter & 0x0F) << 4);                    // Bits 4-7: mloopcounter (4 bits)
                                                                           // Bit 3: RFU (reserved, set to 0)
-uint8_t msd_payload[16];
-uint16_t msd_cid = 0x2446;
-memset(msd_payload, 0, sizeof(msd_payload));
-memcpy(msd_payload, (uint8_t*)&msd_cid, sizeof(msd_cid));
-memcpy(&msd_payload[2], dynamicreturndata, sizeof(dynamicreturndata)); 
-msd_payload[13] = temperatureByte;      // Temperature with 0.5°C accuracy (-40°C to +87.5°C)
-msd_payload[14] = batteryVoltageLowByte; // Battery voltage lower 8 bits (10mV steps)
-msd_payload[15] = statusByte;            // Battery voltage MSB + Reboot flag + Connection requested + RFU + mloopcounter
+    // Update global msd_payload array (public, can be read via handleReadMSD())
+    uint16_t msd_cid = 0x2446;
+    memset(msd_payload, 0, sizeof(msd_payload));
+    memcpy(msd_payload, (uint8_t*)&msd_cid, sizeof(msd_cid));
+    memcpy(&msd_payload[2], dynamicreturndata, sizeof(dynamicreturndata)); 
+    msd_payload[13] = temperatureByte;      // Temperature with 0.5°C accuracy (-40°C to +87.5°C)
+    msd_payload[14] = batteryVoltageLowByte; // Battery voltage lower 8 bits (10mV steps)
+    msd_payload[15] = statusByte;            // Battery voltage MSB + Reboot flag + Connection requested + RFU + mloopcounter
 #ifdef TARGET_NRF
 Bluefruit.Advertising.clearData();
 Bluefruit.Advertising.addFlags(BLE_GAP_ADV_FLAGS_LE_ONLY_GENERAL_DISC_MODE);
@@ -1655,7 +1656,6 @@ void sendDisplayAnnouncement() {
     packet[lengthPos] = totalLength & 0xFF;
     packet[lengthPos + 1] = (totalLength >> 8) & 0xFF;
     size_t bytesWritten = wifiClient.write(packet, pos);
-    // Note: flush() is deprecated, TCP sockets send data immediately
     if (bytesWritten == pos) {
         writeSerial("Display Announcement sent successfully (" + String(bytesWritten) + " bytes)");
     } else {
@@ -2197,6 +2197,8 @@ void initDisplay(){
     writeTextAndFill(infoText.c_str());
     bbepRefresh(&bbep, REFRESH_FULL);
     waitforrefresh(60);
+    bbepSleep(&bbep, 1);  // Put display to sleep before power down
+    delay(200);  // Brief delay after sleep command
     }
     pwrmgm(false);
     }
@@ -2551,6 +2553,25 @@ void handleReadConfig(){
     writeSerial("About to return from handleReadConfig");
     delay(100);
     writeSerial("handleReadConfig function completed successfully");
+}
+
+void handleReadMSD() {
+    writeSerial("=== READ MSD COMMAND (0x0044) ===");
+    uint8_t response[2 + 16];  // Response type + command echo + 16 bytes of MSD data
+    uint16_t responseLen = 0;
+    response[responseLen++] = 0x00;  // Success
+    response[responseLen++] = RESP_MSD_READ;  // Command echo
+    memcpy(&response[responseLen], msd_payload, sizeof(msd_payload));
+    responseLen += sizeof(msd_payload);
+    sendResponse(response, responseLen);
+    writeSerial("MSD read response sent (" + String(responseLen) + " bytes)");
+    String hexDump = "MSD payload: ";
+    for (int i = 0; i < 16; i++) {
+        if (i > 0) hexDump += " ";
+        if (msd_payload[i] < 16) hexDump += "0";
+        hexDump += String(msd_payload[i], HEX);
+    }
+    writeSerial(hexDump);
 }
 
 void handleFirmwareVersion(){
@@ -3761,6 +3782,10 @@ void cleanupDirectWriteState(bool refreshDisplay) {
     directWriteTotalBytes = 0;
     directWriteRefreshMode = 0;
     directWriteStartTime = 0;
+    if (refreshDisplay && displayPowerState) {
+        bbepSleep(&bbep, 1);  // Put display to sleep before power down
+        delay(200);  // Brief delay after sleep command
+    }
     displayPowerState = false;
     pwrmgm(false);
     writeSerial("Direct write state cleaned up");
@@ -3805,6 +3830,8 @@ void handleDirectWriteEnd(uint8_t* data, uint16_t len) {
     delay(100);
     bbepRefresh(&bbep, refreshMode);
     bool refreshSuccess = waitforrefresh(60);
+    bbepSleep(&bbep, 1);  // Put display to sleep before power down
+    delay(200);  // Brief delay after sleep command
     cleanupDirectWriteState(false);
     if (refreshSuccess) {
         uint8_t refreshResponse[] = {0x00, RESP_DIRECT_WRITE_REFRESH_SUCCESS};
@@ -3847,6 +3874,10 @@ void imageDataWritten(BLEConnHandle conn_hdl, BLECharPtr chr, uint8_t* data, uin
         case 0x0043: // Firmware Version command
             writeSerial("=== FIRMWARE VERSION COMMAND (0x0043) ===");
             handleFirmwareVersion();
+            break;
+        case 0x0044: // Read MSD command
+            writeSerial("=== READ MSD COMMAND (0x0044) ===");
+            handleReadMSD();
             break;
         case 0x0070: // Direct Write Start command
             writeSerial("=== DIRECT WRITE START COMMAND (0x0070) ===");

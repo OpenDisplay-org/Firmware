@@ -57,6 +57,7 @@ using namespace Adafruit_LittleFS_Namespace;
 #define RESP_CONFIG_READ             0x40  // Config read response
 #define RESP_CONFIG_WRITE             0x41  // Config write response
 #define RESP_CONFIG_CHUNK             0x42  // Config chunk response
+#define RESP_MSD_READ                 0x44  // MSD (Manufacturer Specific Data) read response
 
 // Communication mode bit definitions (for system_config.communication_modes)
 #define COMM_MODE_BLE           (1 << 0)  // Bit 0: BLE transfer supported
@@ -120,6 +121,7 @@ void bbepStartWrite(BBEPDISP *pBBEP, int iPlane);
 int bbepRefresh(BBEPDISP *pBBEP, int iMode);
 bool bbepIsBusy(BBEPDISP *pBBEP);
 void bbepWakeUp(BBEPDISP *pBBEP);
+void bbepSleep(BBEPDISP *pBBEP, int deepSleep);
 void bbepSendCMDSequence(BBEPDISP *pBBEP, const uint8_t *pSeq);
 void bbepSetAddrWindow(BBEPDISP *pBBEP, int x, int y, int cx, int cy);
 void bbepWriteData(BBEPDISP *pBBEP, uint8_t *pData, int iLen);
@@ -132,6 +134,7 @@ uint8_t mloopcounter = 0;
 uint8_t rebootFlag = 1;  // Set to 1 after reboot, cleared to 0 after BLE connection
 uint8_t connectionRequested = 0;  // Reserved for future features (connection requested flag)
 uint8_t dynamicreturndata[11] = {0};  // Dynamic return data blocks (bytes 2-12 in advertising payload)
+uint8_t msd_payload[16] = {0};  // Manufacturer Specific Data payload (public, updated by updatemsdata())
 
 // Button state tracking structure
 struct ButtonState {
@@ -275,6 +278,7 @@ void handleReadConfig();
 void handleWriteConfig(uint8_t* data, uint16_t len);
 void handleWriteConfigChunk(uint8_t* data, uint16_t len);
 void handleFirmwareVersion();
+void handleReadMSD();  // Read Manufacturer Specific Data (MSD) payload
 void cleanupDirectWriteState(bool refreshDisplay);
 void handleDirectWriteStart(uint8_t* data, uint16_t len);
 void handleDirectWriteData(uint8_t* data, uint16_t len);
